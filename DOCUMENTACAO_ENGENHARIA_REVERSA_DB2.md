@@ -358,3 +358,47 @@ Buscando esses exatos LSNs dentro de `S0000003.LOG` com `./db2_inspector --log`:
 ./db2_inspector /db2data_erp/data/catalog.dat 5 10
 ./db2_inspector /db2data_erp/data/catalog.dat 6 10
 ```
+
+---
+
+## 10. Leitor Direto de Tabelas por Nome (`db2_select.c` — `<BANCO> <SCHEMA> <TABELA>`)
+
+* **Código-fonte:** [`/desenv/db2/db2_select.c`](file:///desenv/db2/db2_select.c)
+* **Binário:** `/desenv/db2/db2_select`
+
+Para permitir consultar os dados de qualquer tabela informando apenas `<BANCO> <SCHEMA> <TABELA>` (sem conectar ao motor Db2), decodificamos mais dois arquivos binários de controle:
+1. **System & Local Database Directory (`sqldbdir/sqldbdir` — 1.512 bytes):**
+   * Assinatura `"DB2 DIRECTORY"` em `0x0000`, `uint32_t num_entries` em `+0x0014`, offset do primeiro registro em `+0x0034` (`0x00D0`, tamanho `0x0518` por entrada).
+   * Em cada entrada (`0x00D0`):
+     * `+0x00` (`char[9]`): `DB Alias` (`"ERP     "`)
+     * `+0x09` (`char[9]`): `DB Name` (`"ERP     "`)
+     * `+0x13` (`char[9]`): Subdiretório físico do banco no Local DB Directory (`"SQL00001"`)
+     * `+0x26` (`char[215]`): Caminho base da instância/banco (`"/db2data_erp/db/erp"`)
+2. **Automatic Storage Group Control File (`SQLSGF.1` — 135.168 bytes):**
+   * Assinatura `"DBSTOGR\0"` em `0x0000`.
+   * Descritor do grupo `IBMSTOGROUP` em `0x1008`, contendo o **Storage Path** em `0x1114` (`"/db2data_erp/data"`).
+
+### Cadeia de Resolução Automática em 5 Passos (`db2_select`):
+1. Resolve `<BANCO>` (`ERP`) lendo `/home/erp/sqllib/sqldbdir/sqldbdir` $\rightarrow$ `/db2data_erp/db/erp/NODE0000/sqldbdir/sqldbdir` $\rightarrow$ `/db2data_erp/db/erp/NODE0000/SQL00001`.
+2. Lê `SQLSGF.1` (`/db2data_erp/data`) e `SQLSPCS.1` (Slot 0 = `SYSCATSPACE` em `/db2data_erp/data/catalog.dat`).
+3. Varre `SYSIBM.SYSTABLES` (`ObjID=5` em `catalog.dat`) comparando `Col 0 (NAME) == <TABELA>` e `Col 1 (CREATOR) == <SCHEMA>`, extraindo `Col 8 (FID / ObjectID)` e `Col 9 (TID / TablespaceID)`.
+4. Varre `SYSIBM.SYSCOLUMNS` (`ObjID=6` em `catalog.dat`) comparando `Col 1 (TBNAME) == <TABELA>` e `Col 2 (TBCREATOR) == <SCHEMA>`, extraindo `NAME` (`Col 0`), `COLTYPE` (`Col 4`), `LENGTH` (`Col 8`), `SCALE` (`Col 9`) e `COLNO` (`Col 10`).
+5. Resolve o container da `TablespaceID` em `SQLSPCS.1` (ex: `/db2data_erp/data/erp/NODE0000/ERP/T0000004/C0000000.LRG`), localiza o `Data EMP` do `ObjectID` na `Object Table (0xFFFF)` e imprime todas as linhas formatadas com os nomes reais das colunas!
+
+### Exemplos de Uso:
+```bash
+# Listar todas as tabelas de um schema no banco
+./db2_select ERP ERP
+
+# Consultar todos os registros de uma tabela
+./db2_select ERP ERP EMPRESA
+./db2_select ERP ERP FILIAL
+
+# Consultar com limite de linhas
+./db2_select ERP ERP CLIENTE 15
+./db2_select ERP ERP ITEM 15
+
+# Consultar qualquer tabela do catálogo interno SYSIBM
+./db2_select ERP SYSIBM SYSTABLESPACES
+./db2_select ERP SYSIBM SYSBUFFERPOOLS
+```

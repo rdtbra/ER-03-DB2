@@ -1,11 +1,14 @@
 CC      = gcc
 CFLAGS  = -O2 -Wall -Wextra -std=c11
-TARGET  = db2_inspector
+TARGETS = db2_inspector db2_select
 
-all: $(TARGET)
+all: $(TARGETS)
 
-$(TARGET): db2_inspector.c
-	$(CC) $(CFLAGS) -o $(TARGET) db2_inspector.c
+db2_inspector: db2_inspector.c
+	$(CC) $(CFLAGS) -o db2_inspector db2_inspector.c
+
+db2_select: db2_select.c
+	$(CC) $(CFLAGS) -o db2_select db2_select.c
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGETS)

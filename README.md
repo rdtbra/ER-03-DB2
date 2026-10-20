@@ -20,7 +20,8 @@ Repositório de estudo prático e engenharia reversa das estruturas internas do 
 ## Estrutura do Repositório
 
 * [`DOCUMENTACAO_ENGENHARIA_REVERSA_DB2.md`](DOCUMENTACAO_ENGENHARIA_REVERSA_DB2.md): Documentação técnica detalhada de toda a investigação e mapeamento de bytes/offsets.
-* [`db2_inspector.c`](db2_inspector.c): Ferramenta em C para inspeção direta de containers, páginas de dados, árvores B+ de índices, arquivos `SQLSPCS.1`, `SQLOGCTL.LFH.1` e Transaction Logs (`S000000X.LOG`).
+* [`db2_select.c`](db2_select.c): **Leitor Direto de Tabelas (`<BANCO> <SCHEMA> <TABELA>`)** — resolve o banco em `sqldbdir`, os storage paths em `SQLSGF.1`, as tablespaces em `SQLSPCS.1`, o catálogo em `SYSIBM.SYSTABLES` (`ObjID=5`) e `SYSIBM.SYSCOLUMNS` (`ObjID=6`), e lista os registros diretamente do container físico sem usar o motor SQL do Db2.
+* [`db2_inspector.c`](db2_inspector.c): Ferramenta em C para inspeção estrutural profunda de containers, páginas de dados, árvores B+ de índices, arquivos `SQLSPCS.1`, `SQLOGCTL.LFH.1` e Transaction Logs (`S000000X.LOG`).
 * [`Makefile`](Makefile): Script de compilação (`gcc -O2 -Wall -Wextra -std=c11`).
 
 ## Compilação e Uso
@@ -28,22 +29,20 @@ Repositório de estudo prático e engenharia reversa das estruturas internas do 
 ```bash
 make
 
-# 1. Inspecionar o arquivo binário de controle de tablespaces (SQLSPCS.1)
+# A. Consultar os dados de qualquer tabela passando <BANCO> <SCHEMA> <TABELA> [LIMITE]
+./db2_select ERP ERP                              # Lista todas as tabelas do schema ERP no banco ERP
+./db2_select ERP ERP EMPRESA                      # Lista todos os dados da tabela ERP.EMPRESA
+./db2_select ERP ERP FILIAL                       # Lista todos os dados da tabela ERP.FILIAL
+./db2_select ERP ERP CLIENTE 15                   # Lista as primeiras 15 linhas de ERP.CLIENTE
+./db2_select ERP ERP ITEM 15                      # Lista as primeiras 15 linhas de ERP.ITEM
+./db2_select ERP SYSIBM SYSTABLESPACES            # Lista qualquer tabela do catálogo SYSIBM
+
+# B. Inspecionar arquivos de controle e estruturas internas de baixo nível (db2_inspector)
 ./db2_inspector --sqlspcs /db2data_erp/db/erp/NODE0000/SQL00001/SQLSPCS.1
-
-# 2. Inspecionar o cabeçalho de controle de Transaction Log (SQLOGCTL.LFH.1)
 ./db2_inspector --lfh /db2data_erp/db/erp/NODE0000/SQL00001/MEMBER0000/SQLOGCTL.LFH.1
-
-# 3. Decodificar um arquivo de Transaction Log (ex: S0000002.LOG ou buscando um LSN específico em S0000003.LOG)
 ./db2_inspector --log /db2data_erp/db/erp/NODE0000/SQL00001/LOGSTREAM0000/S0000002.LOG 0 6
 ./db2_inspector --log /db2data_erp/db/erp/NODE0000/SQL00001/LOGSTREAM0000/S0000003.LOG 0x63029 4
-
-# 4. Inspecionar um container completo (Tag, SMP, Object Table, Tabelas e Índices B+Tree)
 ./db2_inspector /db2data_erp/data/erp/NODE0000/ERP/T0000004/C0000000.LRG
-
-# 5. Inspecionar um Object ID específico (ex: 6 = ERP.ITEM, exibindo as primeiras 10 linhas/chaves)
 ./db2_inspector /db2data_erp/data/erp/NODE0000/ERP/T0000004/C0000000.LRG 6 10
-
-# 6. Inspecionar tabelas do catálogo do sistema diretamente no catalog.dat (ex: 5 = SYSIBM.SYSTABLES)
 ./db2_inspector /db2data_erp/data/catalog.dat 5 10
 ```
