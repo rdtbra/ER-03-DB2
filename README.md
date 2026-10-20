@@ -20,9 +20,10 @@ Repositório de estudo prático e engenharia reversa das estruturas internas do 
 ## Estrutura do Repositório
 
 * [`DOCUMENTACAO_ENGENHARIA_REVERSA_DB2.md`](DOCUMENTACAO_ENGENHARIA_REVERSA_DB2.md): Documentação técnica detalhada de toda a investigação e mapeamento de bytes/offsets.
-* [`db2_select.c`](db2_select.c): **Leitor Direto de Tabelas (`<BANCO> <SCHEMA> <TABELA>`)** — resolve o banco em `sqldbdir`, os storage paths em `SQLSGF.1`, as tablespaces em `SQLSPCS.1`, o catálogo em `SYSIBM.SYSTABLES` (`ObjID=5`) e `SYSIBM.SYSCOLUMNS` (`ObjID=6`), e lista os registros diretamente do container físico sem usar o motor SQL do Db2.
+* [`db2_select.c`](db2_select.c): **Leitor Direto de Tabelas (`<BANCO> <SCHEMA> <TABELA>`)** — resolve a instância em `/var/db2/global.reg`, o banco em `sqldbdir`, os storage paths em `SQLSGF.1`, as tablespaces em `SQLSPCS.1`, o catálogo em `SYSIBM.SYSTABLES` (`ObjID=5`) e `SYSIBM.SYSCOLUMNS` (`ObjID=6`), e lista os registros diretamente do container físico sem usar o motor SQL do Db2.
+* [`db2_rename_idx.c`](db2_rename_idx.c): **Patch Cirúrgico Binário no Catálogo (`catalog.dat`) com Recálculo de Checksum Fletcher-64** — contorna o bloqueio `SQL0607N` do Db2 renomeando diretamente em disco o índice de sistema `SYSIBM.SQL230820161855040` para `ERP.PK_EMP` (atualizando linhas de dados, árvores B+ do catálogo e o BLOB `PACKED_DESC`, e recalculando o checksum de 64 bits de página extraído via disassembly de `_Z25sqlbCalculatePageCheckSumP9SQLB_PAGEi` na `libdb2e.so.1`).
 * [`db2_inspector.c`](db2_inspector.c): Ferramenta em C para inspeção estrutural profunda de containers, páginas de dados, árvores B+ de índices, arquivos `SQLSPCS.1`, `SQLOGCTL.LFH.1` e Transaction Logs (`S000000X.LOG`).
-* [`Makefile`](Makefile): Script de compilação (`gcc -O2 -Wall -Wextra -std=c11`).
+* [`Makefile`](Makefile): Script de compilação (`gcc -O2 -fno-strict-aliasing -Wall -Wextra -std=c11`).
 
 ## Compilação e Uso
 

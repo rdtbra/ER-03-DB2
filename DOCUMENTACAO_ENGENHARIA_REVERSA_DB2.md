@@ -402,3 +402,77 @@ Para permitir consultar os dados de qualquer tabela informando apenas `<BANCO> <
 ./db2_select ERP SYSIBM SYSTABLESPACES
 ./db2_select ERP SYSIBM SYSBUFFERPOOLS
 ```
+
+---
+
+## 11. Engenharia Reversa do Checksum de Página (`sqlbCalculatePageCheckSum`) e Patch Cirúrgico no Catálogo (`db2_rename_idx.c`)
+
+* **Código-fonte:** [`/desenv/db2/db2_rename_idx.c`](file:///desenv/db2/db2_rename_idx.c)
+* **Binário:** `/desenv/db2/db2_rename_idx`
+
+### 11.1 Por que o Db2 bloqueia `RENAME INDEX SYSIBM.SQL...` (`SQL0607N`)?
+Na tabela `ERP.EMPRESA`, a Primary Key foi criada sem nome explícito de índice, fazendo o Db2 gerar o índice `SYSIBM.SQL230820161855040` (`USER_DEFINED = 0`, `SYSTEM_REQUIRED = 1`). Ao tentar executar `RENAME INDEX SYSIBM.SQL230820161855040 TO PK_EMP` via SQL, o Db2 recusa a operação com:
+```text
+SQL0607N  "RENAME" is not defined for system objects.  SQLSTATE=42832
+```
+
+### 11.2 Engenharia Reversa do Checksum de Página de 64 bits (`libdb2e.so.1`)
+Qualquer alteração binária direta nas páginas de 4096 bytes de `/db2data_erp/data/catalog.dat` é rejeitada pelo Buffer Pool Services (`sqlb_verify_page` $\rightarrow$ `ZRC=0x86020019=SQLB_CSUM "Bad Page, Checksum Error"`) se o campo `uint64_t checksum_meta` no offset `+0x28` do cabeçalho `BPS Page Header` não bater exatamente com o conteúdo da página.
+
+Desmontando as funções `_Z25sqlbCalculatePageCheckSumP9SQLB_PAGEi` (`0x0281a060`), `_Z16sqlb_verify_pageP9SQLB_PAGEP16SQLB_OBJECT_DESCjjP12SQLB_GLOBALSPm` (`0x028121f0`) e suas variantes SIMD (`_Z18ossFletcher64_sse2PKjm`, `_Z19sqlbFletcher64_avx2PKjm`, `_Z21sqlbFletcher64_avx512PKjm`) em `/opt/ibm/db2/V11.5/lib64/libdb2e.so.1`, extraímos o algoritmo exato (**Fletcher-64 modificado**):
+
+1. Copiam-se os 4096 bytes da página para um vetor `uint32_t words[1024]`.
+2. Se o bit `0x10` de `page[0x0B]` (`cbits`) estiver ativo, força-se temporariamente `words[0x1C / 4] = 0xFFFFFFFFU` (`diskPageID`).
+3. Zera-se o próprio campo de checksum de 64 bits no offset `+0x28`: `words[10] = 0; words[11] = 0;`.
+4. Acumulam-se as 1024 palavras `uint32_t` little-endian em dois acumuladores de 64 bits inicializados com `0xFFFFFFFFULL`:
+   ```c
+   uint64_t s1 = 0xFFFFFFFFULL;
+   uint64_t s2 = 0xFFFFFFFFULL;
+   for (int i = 0; i < 1024; i++) {
+       s1 += words[i];
+       s2 += s1;
+   }
+   ```
+5. Reduz-se `s1` (soma em complemento de um) duas vezes para 32 bits e duas vezes para 16 bits:
+   ```c
+   s1 = (s1 & 0xFFFFFFFFULL) + (s1 >> 32);
+   s1 = (s1 & 0xFFFFFFFFULL) + (s1 >> 32);
+   s1 = (s1 & 0xFFFFULL) + (s1 >> 16);
+   s1 = (s1 & 0xFFFFULL) + (s1 >> 16);
+   ```
+6. Reduz-se `s2` duas vezes para 48 bits:
+   ```c
+   s2 = (s2 & 0xFFFFFFFFFFFFULL) + (s2 >> 48);
+   s2 = (s2 & 0xFFFFFFFFFFFFULL) + (s2 >> 48);
+   ```
+7. O checksum final de 64 bits gravado em `+0x28` combina `s2` nos 48 bits superiores e `s1` nos 16 bits inferiores:
+   ```c
+   uint64_t checksum = ((s2 & 0xFFFFFFFFFFFFULL) << 16) | (s1 & 0xFFFFULL);
+   ```
+
+### 11.3 Páginas Modificadas no Patch Cirúrgico (`SYSIBM.SQL230820161855040` $\rightarrow$ `ERP.PK_EMP`)
+O utilitário [`db2_rename_idx.c`](file:///desenv/db2/db2_rename_idx.c) atualiza cirurgicamente **12 páginas** de `/db2data_erp/data/catalog.dat` e recalcula o Fletcher-64 de cada página BPS:
+1. **`SYSIBM.SYSINDEXES` (`ObjID=7`) — Linha de Dados (`FilePg=20426`, `Slot=2`, `Off=0xAF1`):**
+   * Altera `NAME` (`Col 0`) de `"SQL230820161855040"` (18B) para `"PK_EMP"` (6B) e `CREATOR` (`Col 1`) de `"SYSIBM  "` para `"ERP     "`.
+   * Recalcula os offsets de todas as colunas `VARCHAR` subsequentes (`TBNAME`, `TBCREATOR`, `COLNAMES`, `PAGE_FETCH_PAIRS`, `DEFINER`, `AVGPARTITION_PAGE_FETCH_PAIRS`), encolhe `rec_len` de `387` para `375` bytes e incrementa `total_free_space` (`+0x32`) em `+12` bytes (`Checksum: 0x2062052A8D45D5DC -> 0x1F4537246E24D2DC`).
+2. **Índice B+Tree `INDINDEXES01` (`+CREATOR+NAME`, `ObjID=7`):**
+   * Remove a chave antiga `('SYSIBM  ', 'SQL230820161855040') -> RID(42:2)` da página folha `FilePg=1300` (`k[47]`) e insere em ordem lexicográfica a nova chave de 25 bytes `('ERP     ', 'PK_EMP') -> RID(42:2)` na página folha `FilePg=1290` (`k[1]`, entre `PK_CLIENTE` e `PK_FILIAL`).
+3. **`SYSIBM.SYSINDEXCOLUSE` (`ObjID=9`) — Linha de Dados (`FilePg=881`, `Slot=15`) + B+Tree `INDINDEXCOLUSE01`:**
+   * Altera `INDSCHEMA` para `"ERP     "` e `INDNAME` para `"PK_EMP"` na linha de dados (`FilePg=881`), remove a chave antiga da folha `FilePg=12340` (`k[31]`) e insere a nova chave `('ERP     ', 'PK_EMP', 'EMP_COD', 1) -> RID(17:15)` na folha `FilePg=12323` (`k[2]`).
+4. **`SYSIBM.SYSINDEXAUTH` (`ObjID=20`) — Linha de Dados (`FilePg=3136`, `Slot=7`) + B+Trees (`FilePg=3202`, `FilePg=3203`):**
+   * Atualiza `NAME` e `CREATOR` na linha de dados e reordena o diretório de slots das páginas folha `FilePg=3202` e `FilePg=3203` (`k[3] -> k[1]`).
+5. **`SYSIBM.SYSCONSTDEP` (`ObjID=263`) — Linha de Dados (`FilePg=4896`, `Slot=7`) + B+Tree (`FilePg=4962`):**
+   * Atualiza a dependência da Primary Key (`CONSTNAME = SQL230820161855060`) para apontar para `BSCHEMA = 'ERP     '` e `BNAME = 'PK_EMP'` na linha de dados e reordena a chave na folha `FilePg=4962` (`k[3] -> k[1]`).
+6. **`SYSIBM.SYSTABLES` `PACKED_DESC` BLOB (`ObjID=5`, `FilePg=1157`):**
+   * Atualiza o descritor binário compilado da tabela `ERP.EMPRESA` na página LOB `FilePg=1157`: ajusta o offset final do nome do índice em `+0xA3A` (`0x037A -> 0x036E`), altera o schema do índice em `+0xA6D` (`"SYSIBM  " -> "ERP     "`) e grava `"PK_EMP+EMP_COD"` em `+0xB50`.
+
+### 11.4 Validação no Motor Real do IBM Db2 (`db2start`)
+Após iniciar a instância (`db2start`), o próprio motor SQL do Db2 validou todos os checksums Fletcher-64 e passou a exibir e utilizar oficialmente o índice `ERP.PK_EMP`:
+```text
+INDSCHEMA  INDNAME              TABSCHEMA  TABNAME      COLNAMES             UNIQUERULE
+---------- -------------------- ---------- ------------ -------------------- ----------
+ERP        PK_CLIENTE           ERP        CLIENTE      +EMP_COD+CLI_COD     P         
+ERP        PK_EMP               ERP        EMPRESA      +EMP_COD             P         
+ERP        PK_FILIAL            ERP        FILIAL       +EMP_COD+FIL_COD     P         
+ERP        PK_ITEM              ERP        ITEM         +EMP_COD+ITE_COD     P         
+```
