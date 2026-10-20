@@ -1,0 +1,4 @@
+db2_inspector
+*.o
+*.RPT
+*.BAK
