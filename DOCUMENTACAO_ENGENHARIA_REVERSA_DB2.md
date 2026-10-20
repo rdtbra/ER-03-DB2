@@ -476,3 +476,79 @@ ERP        PK_EMP               ERP        EMPRESA      +EMP_COD             P
 ERP        PK_FILIAL            ERP        FILIAL       +EMP_COD+FIL_COD     P         
 ERP        PK_ITEM              ERP        ITEM         +EMP_COD+ITE_COD     P         
 ```
+
+---
+
+## 12. Engenharia Reversa das Operações `INSERT`, `DELETE`, `UPDATE` e `RE-INSERT` (`libdb2e.so.1` + Transaction Log)
+
+Por meio do disassembly de `/opt/ibm/db2/V11.5/lib64/libdb2e.so.1` combinado com o monitoramento ao vivo das páginas físicas (`FilePg=1952` Dados e `FilePg=226` Índice B+Tree) e do arquivo de log ativo (`S0000000.LOG`), mapeamos o fluxo completo de execução das operações DML e a estrutura exata dos registros de Write-Ahead Logging (WAL).
+
+### 12.1 Anatomia do Cabeçalho Comum de Log (`SQLP_LRH` — 40 bytes em FormatVer=14)
+Todo registro gravado pela função `_Z11sqlpWriteLRP8sqeAgentmmmmmP14SQLP_LREC_PARTmP9SQLP_LSN8Pm` (`0x09587120`) possui um cabeçalho DPS de **40 bytes (`0x00..0x27`)**, seguido imediatamente em **`+0x28`** pelo cabeçalho do componente (`SQLD_LRH` para tabelas ou `SQLI_LRH` para índices):
+
+| Offset | Tipo C | Campo | Descrição |
+| :--- | :--- | :--- | :--- |
+| `+0x00` | `uint32_t` | `rec_len` | Tamanho total do registro de log em bytes |
+| `+0x04` | `uint16_t` | `rec_type` | `0x004E` (`'N'` Undo/Redo), `0x0052` (`'R'` Redo-Only / Internal), `0x0042` (`'B'` CLR Undo), `0x0084` (Commit), `0x0041` (Abort) |
+| `+0x06` | `uint16_t` | `rec_flags` | Flags do registro DPS (`0x0000` normal, `0x2000` fim de transação) |
+| `+0x08` | `uint64_t` | `lsn` | `SQLP_LSN8` (Log Sequence Number de 64 bits atribuído ao registro e gravado em `page + 0x20`) |
+| `+0x10` | `uint8_t[6]`| `tid` | Transaction ID de 6 bytes (ex: `0D 20 00 00 00 00` = `0x00000000200D`) + 2B padding |
+| `+0x18` | `uint64_t` | `prev_lso` | Log Space Offset (`LSO`) do registro anterior da mesma transação (0 no 1º registro da transação) |
+| `+0x20` | `uint64_t` | `savepoint` | Identificador interno de Savepoint da instrução SQL (`sqlpSpReq`) |
+| **`+0x28`** | `uint8_t` | `comp_id` | **`0x01` = DOM (Data Object Manager)** \| **`0x02` = IXM (Index Manager)** |
+| **`+0x29`** | `uint8_t` | `func_id` | Opcode da operação: `0xA2` (DOM Insert), `0xA1` (DOM Delete), `0x72`/`0xB7`/`0xBE` (DOM Update), `0x65` (IXM Insert Key), `0x8D` (IXM Pseudo-Delete Key), `0x8C` (IXM Cleanup Pseudo-Deleted Keys) |
+
+---
+
+### 12.2 Como o Db2 Executa o `INSERT`
+1. **Cadeia de Funções em `libdb2e.so.1`:**
+   * `sqlriisr(sqlrr_cb*)` (`0x0a13a120`) $\rightarrow$ `sqlrinsr` (`0x0a088c10`) $\rightarrow$ `sqldRowInsert` (`0x02acd690`):
+     * Abre um Savepoint de instrução (`sqlpSpReq` em `0x095391c0`).
+     * Serializa o vetor `SQLD_VALUE**` no formato binário de disco `FIXEDVAR` (`sqldFastFormatFixedVar` em `0x02ada4d0` / `sqldFullFormatFixedVar` em `0x029b63f0`).
+     * Invoca `sqldInsertRow` (`0x02a1cdb0`), que localiza uma página com espaço livre via FSCR (*Free Space Control Record*, `sqldFindPageFromTargetFSCR` em `0x02a13e80`) e chama `sqldAddRow` (`0x02a1f700`).
+     * `sqldAddRow` fixa a página no Bufferpool (`sqlbfix` em `0x02601890`), aloca um slot no *Slot Directory* (reutilizando o primeiro slot com `0xFFFF` ou expandindo `slot_count`), copia a linha para o heap da página, chama **`sqldWriteInsertLR` (`0x02a20f40`)** para gravar o log WAL e atualiza `page_lsn` (`+0x20`).
+     * Em seguida, `sqldRowInsert` chama `sqldKeyInsert` (`0x02ad6650`) $\rightarrow$ `sqliaddk` (`0x0ae3a7c0`), que desce pela B+Tree (`sqlischa` em `0x0af18820`), insere a chave ordenada na página folha (`sqliiadd` em `0x0ae3c340`) e grava o log de índice via **`sqlilidx` (`0x0ad69350`)**.
+2. **Como o `INSERT` é Escrito no Transaction Log (`sqldWriteInsertLR` em `0x02a20f40`):**
+   * Grava `comp_id = 0x01` (`movb $0x1, 0x80(%rsp)`) e `func_id = 0xA2` (`movb $0xa2, 0x81(%rsp)` — ou `0xA5` se a página estava vazia).
+   * No cabeçalho `SQLD_LRH` (`+0x28..+0x3F`), grava `pool_id` (`+0x2A`), `obj_id` (`+0x2C`), `rec_len` (`+0x30`), `free_space_after` (`+0x32`), o **RID de 6 bytes (`Slot` em `+0x34`, `Page` em `+0x36`)** e o `record_offset` (`+0x3A`).
+   * **Otimização de 4 bytes (`lea -0x4(%r14), %rcx` em `0x2a2128e`):** Como os 4 primeiros bytes do registro `FIXEDVAR` (`rec_type` e `rec_len`) já estão codificados no cabeçalho `SQLD_LRH`, `sqldWriteInsertLR` omite esses 4 bytes e grava em `+0x40` apenas os **`rec_len - 4` bytes** restantes da imagem Redo da linha!
+   * Logo após, `sqlilidx` grava um segundo registro (`comp_id = 0x02`, `func_id = 0x65`), contendo `RootPg`, `LeafPg`, o `RID` alvo (`flags = 0x02`) e os bytes da chave inserida.
+
+---
+
+### 12.3 Como o Db2 Executa o `DELETE`
+1. **Cadeia de Funções em `libdb2e.so.1`:**
+   * `sqlridel(sqlrr_cb*)` (`0x0a139350`) $\rightarrow$ `sqldRowDelete` (`0x02ab9ca0`) $\rightarrow$ `sqldDeleteRow` (`0x02a2ca20`):
+     * Adquire lock exclusivo `X` na linha (`sqldLockForWrite` em `0x029ceef0`) e abre Savepoint (`sqlpSpReq`).
+     * Fixa a página (`sqldFixPageForDelete` em `0x02a2ec30`), posiciona no slot (`sqldPositionOnRow` em `0x02a33020`) e **copia a linha inteira para uma Work Area em memória** (`_intel_fast_memcpy` em `0x02a2d426`) antes de remover o registro da página.
+     * Chama `sqldRemoveRow` (`0x02a2fb20`) $\rightarrow$ **`sqldLogAndDeleteRecord` (`0x02a30c20`)** $\rightarrow$ **`sqldWriteDeleteLR` (`0x02a31210`)**.
+     * Por fim, usa a cópia em memória da linha excluída para extrair as chaves de índice (`sqldBuildDKEYFromData` em `0x02994d40`) e chama `sqldKeyDelete` (`0x02abb030`) $\rightarrow$ `sqlidelk` (`0x0ae80490`) $\rightarrow$ `sqliCursorDel` (`0x0af39b30`) $\rightarrow$ **`procLeaf2Del` (`0x0af2d6e0`)**.
+2. **O Que `sqldLogAndDeleteRecord` (`0x02a30c20`) Faz na Página de Dados (`FilePg=1952`):**
+   * **Não zera os bytes do registro no heap da página!** Os bytes antigos permanecem intocados no espaço livre da página até serem sobrescritos.
+   * Mantém `slot_count` (`+0x30`) inalterado para jamais deslocar os `RIDs` das demais linhas, e grava **`0xFFFF` (`-1`)** na entrada do *Slot Directory* (`mov $0xffffffff, %esi; mov %si, 0x14(%r12,%r10,2)` em `0x2a30e07`, ou seta o bit 15 `|= 0x8000` em modo de pseudo-deleção de linha).
+   * Reserva os bytes liberados nos contadores de espaço excluído da página (`+0x34` = `unreserved_deleted_space` e `+0x36` = `tx_deleted_space`, ambos recebendo `0x003E = 62`) e carimba os **6 bytes do ID de Transação/Savepoint (`+0x3C..+0x41`)** no cabeçalho da página (`0x2a30ef4..0x2a30f06`), impedindo que outra transação concorrente consuma esse espaço antes do `COMMIT` da transação que fez o `DELETE`!
+3. **O Que `procLeaf2Del` (`0x0af2d6e0`) Faz na Folha B+Tree (`FilePg=226`) — *Pseudo-Delete*:**
+   * Em índices Type-2 do Db2, o `DELETE` **não remove fisicamente a chave da página folha B+Tree**!
+   * Ele apenas liga o bit `0x01` no byte de flags do `RID` dentro da chave na folha (alterando `flags` de **`0x02` para `0x03`** em `+0x2F5`), incrementa o contador de chaves pseudo-deletadas da folha (`+0x0B0`: `00 00 -> 01 00`) e liga o bit `0x20` no estado da página folha (`+0x036`: `10 41 -> 20 41`).
+4. **Como o `DELETE` é Escrito no Transaction Log (`sqldWriteDeleteLR` em `0x02a31210` e `sqlilkey` em `0x0aec43f0`):**
+   * Na tabela: `sqldWriteDeleteLR` grava `comp_id = 0x01`, `func_id = 0xA1` (`movb $0xa1, 0x29(%rax)` em `0x2a31312`), o `RID(Page:Slot)` e, em `+0x40`, grava a **Before-Image completa (`rec_len - 4` bytes) da linha excluída**! Isso garante que, em caso de `ROLLBACK`, `sqldLogAndUndoDelete` (`0x02a58630`) tenha todos os bytes para restaurar a linha no mesmo `RID`.
+   * No índice: `sqlilkey` grava `comp_id = 0x02`, `func_id = 0x8D` (`IXM_PSEUDO_DELETE_KEY`), registrando `LeafPg`, `KeySlot`, o `RID` e o valor da chave.
+
+---
+
+### 12.4 Como o Db2 Executa o `INSERT` Subsequente (Reuso de Slot e Limpeza de Pseudo-Deleted Keys)
+Quando um novo `INSERT` é executado após o `DELETE` (já comitado):
+1. **Na Página de Dados (`sqldAddRow` / `sqldReclaimPseudoDeletedSpaceRuntime` em `0x02a398c0`):**
+   * Verifica que o carimbo de transação em `+0x3C..+0x41` (`00 00 00 00 2B CC`) pertence a uma transação já comitada (`sqlpGetCommitLSN`), zera os contadores de espaço bloqueado (`+0x34`, `+0x36` e `+0x3C..+0x41`), varre o *Slot Directory* (`+0x44`), encontra o **`Slot 7 == 0xFFFF`** deixado pelo `DELETE` e **reutiliza exatamente o `RID(Page=0 : Slot=7)`**, sobrescrevendo o endereço `0x0A80` (`Off=0x0A3C`)!
+2. **Na Página Folha B+Tree e no Transaction Log (`sqliTryToCleanup` + Encadeamento `PrevLSO`):**
+   * Caso a chave inserida seja diferente (ex: `EMP_COD = 5`), a chave antiga `EMP_COD = 4` permanece temporariamente com `flags = 0x03` ou é limpa por `sqliCleanupKeysOnLeaf` (`0x0af2e5e0`), que grava no log um registro especial **`Type = 0x0052` (Redo-Only) com `comp_id = 0x02, func_id = 0x8C` (`IXM_CLEANUP_PSEUDO_DELETED_KEYS`)**.
+   * **Detalhe Arquitetural Notável na Cadeia `PrevLSO`:** No log da transação `TID=0x2010`, o `Rec #38` (`DOM INSERT 0xA2`, `LSO=103273464`) é seguido pelo `Rec #39` (`IXM CLEANUP 0x8C`, `Type=0x0052`, `LSO=103273586`, `PrevLSO=103273464`) e pelo `Rec #40` (`IXM INSERT 0x65`, `Type=0x004E`, `LSO=103273670`). Porém, o `PrevLSO` do `Rec #40` aponta para **`103273464` (`Rec #38`)**, **pulando o `Rec #39`**! Isso ocorre porque a limpeza física de uma chave pseudo-deletada de outra transação já comitada é uma operação *Redo-Only* (`0x0052`) que jamais deve ser desfeita caso a transação atual sofra `ROLLBACK`.
+   * Caso a chave re-inserida seja idêntica à chave pseudo-deletada (`EMP_COD = 4` no mesmo `RID(0:7)`), o Db2 simplesmente reverte o byte de flag na folha B+Tree de **`0x03` $\rightarrow$ `0x02`** e decrementa o contador de pseudo-deletados de `1` para `0`!
+
+---
+
+### 12.5 Como o Db2 Executa o `UPDATE` (`sqldReplaceRow` em `0x02a713e0`)
+Durante a investigação também desmontamos as 3 funções de log de `UPDATE` chamadas por `sqldReplaceRow`:
+* **`sqldWriteXOROnlyLR` (`0x02a73120` — `comp_id = 0x01, func_id = 0x72`):** Calcula um `XOR` bit a bit (`old_bytes ^ new_bytes`) da fatia alterada da linha (`xor (%r11,%rdi,8), %rax` em `0x2a73459`), pois o mesmo vetor XOR serve tanto para **Redo** (`old ^ xor = new`) quanto para **Undo** (`new ^ xor = old`)!
+* **`sqldWriteXORFullOffsetLR` (`0x02a75420` — `comp_id = 0x01, func_id = 0xB7`):** Variante XOR com offset completo.
+* **`sqldWriteFullBeforeDeltaUpdLR` (`0x02a74640` — `comp_id = 0x01, func_id = 0xBE`):** Grava a Before-Image completa de `rec_len - 4` bytes (para Undo) seguida apenas da fatia Delta modificada (`DeltaOff` em `+0x42`, `DeltaLen` em `+0x44`) para Redo (exatamente como capturado no `Rec #33`, `LSN=0x7D453` em `S0000000.LOG`).

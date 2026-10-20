@@ -1082,16 +1082,21 @@ static const char *log_rec_type_desc(uint16_t rec_type, const uint8_t *payload, 
     if (rec_type == 0x0041) return "ABORT / ROLLBACK";
     if (rec_type == 0x0082 || rec_type == 0x0042) return "COMPENSATION (CLR / UNDO)";
     if ((rec_type == 0x004E || rec_type == 0x0052) && payload_len >= 12) {
-        uint8_t comp_id  = payload[4];
         uint8_t sub_comp = payload[8];
         uint8_t op_code  = payload[9];
-        if (comp_id == 0x05 && sub_comp == 0x01 && op_code == 0xA2) return "DMS DOM INSERT ROW";
-        if (comp_id == 0x05 && sub_comp == 0x01 && op_code == 0xA3) return "DMS DOM DELETE ROW";
-        if (comp_id == 0x05 && sub_comp == 0x01 && op_code == 0xA4) return "DMS DOM UPDATE ROW";
-        if (comp_id == 0x05 && sub_comp == 0x01 && op_code == 0x85) return "DMS DOM APPEND PAGE (Update Page0 Slot0)";
-        if (comp_id == 0x05 && sub_comp == 0x02 && op_code == 0x65) return "DMS IXM INSERT KEY (B+Tree)";
-        if (comp_id == 0x05 && sub_comp == 0x02 && op_code == 0x66) return "DMS IXM DELETE KEY (B+Tree)";
-        if (comp_id == 0x05) return "DMS DATA/SPACE OP";
+        if (sub_comp == 0x01 && op_code == 0xA2) return "DMS DOM INSERT ROW (sqldWriteInsertLR)";
+        if (sub_comp == 0x01 && op_code == 0xA5) return "DMS DOM INSERT EMPTY PAGE (sqldWriteInsertLR)";
+        if (sub_comp == 0x01 && op_code == 0xA1) return "DMS DOM DELETE ROW (sqldWriteDeleteLR)";
+        if (sub_comp == 0x01 && op_code == 0xA4) return "DMS DOM DELETE TO EMPTY PAGE (sqldWriteDeleteLR)";
+        if (sub_comp == 0x01 && op_code == 0x72) return "DMS DOM XOR UPDATE ROW (sqldWriteXOROnlyLR)";
+        if (sub_comp == 0x01 && op_code == 0xB7) return "DMS DOM XOR FULL OFFSET UPDATE (sqldWriteXORFullOffsetLR)";
+        if (sub_comp == 0x01 && op_code == 0xBE) return "DMS DOM FULL-BEFORE DELTA UPDATE (sqldWriteFullBeforeDeltaUpdLR)";
+        if (sub_comp == 0x01 && op_code == 0x85) return "DMS DOM APPEND PAGE (Update Page0 Slot0)";
+        if (sub_comp == 0x01 && op_code == 0xA8) return "DMS DOM RECLAIM PSEUDO-DELETED SPACE";
+        if (sub_comp == 0x02 && op_code == 0x65) return "DMS IXM INSERT KEY (B+Tree sqlilidx)";
+        if (sub_comp == 0x02 && op_code == 0x8D) return "DMS IXM PSEUDO-DELETE KEY (B+Tree sqlilkey)";
+        if (sub_comp == 0x02 && op_code == 0x8C) return "DMS IXM CLEANUP PSEUDO-DELETED KEYS (sqliTryToCleanup)";
+        if (sub_comp == 0x02 && op_code == 0x66) return "DMS IXM DELETE KEY (B+Tree)";
     }
     if (rec_type == 0x0052) return "INTERNAL / LOG SYNC";
     return "UNDO/REDO RECORD";
@@ -1230,8 +1235,8 @@ static int inspect_log_file(const char *path, uint64_t target_lsn, uint32_t max_
         total_recs++;
 
         if (rhdr->rec_type == 0x0084 || rhdr->rec_type == 0x0043) commit_recs++;
-        else if (rhdr->rec_type == 0x004E && payload_len >= 12 && payload[4] == 0x05) {
-            if (payload[8] == 0x01 && payload[9] == 0xA2) dom_ins_recs++;
+        else if (rhdr->rec_type == 0x004E && payload_len >= 12) {
+            if (payload[8] == 0x01 && (payload[9] == 0xA2 || payload[9] == 0xA5)) dom_ins_recs++;
             else if (payload[8] == 0x02 && payload[9] == 0x65) ixm_ins_recs++;
         }
 
@@ -1256,32 +1261,48 @@ static int inspect_log_file(const char *path, uint64_t target_lsn, uint32_t max_
                 uint32_t commit_ts = *(const uint32_t *)(payload + 8);
                 printf("    >> [COMMIT] Timestamp Epoch = 0x%08X (%u)\n", commit_ts, commit_ts);
             } else if (rhdr->rec_type == 0x004E && payload_len >= 28 &&
-                       payload[4] == 0x05 && payload[8] == 0x01 && payload[9] == 0xA2) {
-                /* DMS DOM Insert Row */
+                       payload[8] == 0x01 && (payload[9] == 0xA2 || payload[9] == 0xA1)) {
+                /* DMS DOM Insert Row (0xA2) ou Delete Row (0xA1) */
+                const char *op_lbl = (payload[9] == 0xA2) ? "DOM INSERT" : "DOM DELETE";
+                const char *img_lbl = (payload[9] == 0xA2) ? "REDO ROW  " : "UNDO ROW  ";
                 uint16_t tbsp_id  = *(const uint16_t *)(payload + 10);
                 uint16_t obj_id   = *(const uint16_t *)(payload + 12);
                 uint16_t row_len  = *(const uint16_t *)(payload + 16);
+                uint16_t fs_after = *(const uint16_t *)(payload + 18);
                 uint16_t rid_slot = *(const uint16_t *)(payload + 20);
                 uint32_t rid_page = *(const uint32_t *)(payload + 22);
-                printf("    >> [DOM INSERT] Tablespace=%u | ObjectID=%u | Target RID=(Page=%u : Slot=%u) | RowLen=%u B\n",
-                       tbsp_id, obj_id, rid_page, rid_slot, row_len);
+                uint16_t rec_off  = *(const uint16_t *)(payload + 26);
+                printf("    >> [%s] Tablespace=%u | ObjectID=%u | Target RID=(Page=%u : Slot=%u, Off=0x%04X) | RowLen=%u B | FreeSpace=%u B\n",
+                       op_lbl, tbsp_id, obj_id, rid_page, rid_slot, rec_off, row_len, fs_after);
 
-                if (payload_len >= 28u + row_len && row_len >= 12) {
-                    const uint8_t *row_img = payload + 28;
-                    printf("    >> [ROW IMAGE ] Header=(type=0x%04X len=%u flags=0x%04X fixlen=%u) ASCII=\"",
+                if (row_len >= 8 && payload_len >= 32u + (row_len - 4u)) {
+                    const uint8_t *row_img = payload + 32;
+                    uint16_t body_len = row_len - 4;
+                    printf("    >> [%s] Header=(var_flag=0x%04X fixlen=%u) ASCII=\"",
+                           img_lbl,
                            *(const uint16_t *)(row_img + 0),
-                           *(const uint16_t *)(row_img + 2),
-                           *(const uint16_t *)(row_img + 4),
-                           *(const uint16_t *)(row_img + 6));
-                    for (uint16_t b = 8; b < row_len && b < 72; b++) {
+                           *(const uint16_t *)(row_img + 2));
+                    for (uint16_t b = 4; b < body_len && b < 68; b++) {
                         uint8_t ch = row_img[b];
                         putchar(isprint(ch) ? ch : '.');
                     }
                     printf("\"\n");
                 }
+            } else if (rhdr->rec_type == 0x004E && payload_len >= 38 &&
+                       payload[8] == 0x01 && payload[9] == 0xBE) {
+                /* DMS DOM Full-Before Delta Update (0xBE) */
+                uint16_t tbsp_id   = *(const uint16_t *)(payload + 10);
+                uint16_t obj_id    = *(const uint16_t *)(payload + 12);
+                uint16_t rid_slot  = *(const uint16_t *)(payload + 16);
+                uint32_t rid_page  = *(const uint32_t *)(payload + 18);
+                uint16_t row_len   = *(const uint16_t *)(payload + 24);
+                uint16_t delta_off = *(const uint16_t *)(payload + 34);
+                uint16_t delta_len = *(const uint16_t *)(payload + 36);
+                printf("    >> [DOM UPDATE] Tablespace=%u | ObjectID=%u | Target RID=(Page=%u : Slot=%u) | RowLen=%u B | DeltaOff=+%u | DeltaLen=%u B\n",
+                       tbsp_id, obj_id, rid_page, rid_slot, row_len, delta_off, delta_len);
             } else if (rhdr->rec_type == 0x004E && payload_len >= 56 &&
-                       payload[4] == 0x05 && payload[8] == 0x02 && payload[9] == 0x65) {
-                /* DMS IXM Insert Key */
+                       payload[8] == 0x02 && payload[9] == 0x65) {
+                /* DMS IXM Insert Key (0x65) */
                 uint16_t idx_tbsp  = *(const uint16_t *)(payload + 10);
                 uint16_t idx_obj   = *(const uint16_t *)(payload + 12);
                 uint16_t index_id  = *(const uint16_t *)(payload + 18);
@@ -1299,14 +1320,26 @@ static int inspect_log_file(const char *path, uint64_t target_lsn, uint32_t max_
                     }
                     printf("\n");
                 }
-            } else if (payload_len >= 24 && payload[4] == 0x05) {
-                /* Outros registros DMS (ex: Op=0x85 Update Page Count / Slot 0 na Página 0) */
+            } else if (rhdr->rec_type == 0x004E && payload_len >= 54 &&
+                       payload[8] == 0x02 && payload[9] == 0x8D) {
+                /* DMS IXM Pseudo-Delete Key (0x8D) */
+                uint16_t idx_tbsp  = *(const uint16_t *)(payload + 10);
+                uint16_t idx_obj   = *(const uint16_t *)(payload + 12);
+                uint16_t index_id  = *(const uint16_t *)(payload + 18);
+                uint32_t leaf_pg   = *(const uint32_t *)(payload + 20);
+                uint16_t rid_slot  = *(const uint16_t *)(payload + 28);
+                uint32_t rid_page  = *(const uint32_t *)(payload + 30);
+                uint32_t key_slot  = *(const uint32_t *)(payload + 36);
+                printf("    >> [IXM DELETE] Tbsp=%u | ObjID=%u | IndexID=%u (LeafPg=%u, KeySlot=%u) ==> Target RID=(Page=%u : Slot=%u)\n",
+                       idx_tbsp, idx_obj, index_id, leaf_pg, key_slot, rid_page, rid_slot);
+            } else if (payload_len >= 24 && (payload[8] == 0x01 || payload[8] == 0x02)) {
+                /* Outros registros DMS (ex: Op=0x85 Update Page Count, Op=0xA8 Reclaim Space) */
                 uint16_t tbsp_id  = *(const uint16_t *)(payload + 10);
                 uint16_t obj_id   = *(const uint16_t *)(payload + 12);
                 uint32_t new_pg   = *(const uint32_t *)(payload + 16);
                 uint32_t meta_val = *(const uint32_t *)(payload + 20);
-                printf("    >> [DMS OP    ] Comp=0x%02X Sub=0x%02X Op=0x%02X | Tablespace=%u | ObjectID=%u | Param1=%u | Param2=%u\n",
-                       payload[4], payload[8], payload[9], tbsp_id, obj_id, new_pg, meta_val);
+                printf("    >> [DMS OP    ] Sub=0x%02X Op=0x%02X | Tablespace=%u | ObjectID=%u | Param1=%u | Param2=%u\n",
+                       payload[8], payload[9], tbsp_id, obj_id, new_pg, meta_val);
             }
             printf("\n");
         }
