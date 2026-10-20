@@ -232,7 +232,103 @@ Todos os índices de uma tabela residem no mesmo Objeto de Índice (`Type = 0x01
 
 ---
 
-## 8. Ferramenta Desenvolvida em C (`db2_inspector.c`)
+## 8. Engenharia Reversa de Transaction Logs (`SQLOGCTL.LFH` e `S000000X.LOG`)
+
+### 8.1. Log File Header (`SQLOGCTL.LFH.1` / `SQLOGCTL.LFH.2` — 12 KB)
+O Db2 mantém duas cópias espelhadas de 12 KB (`SQLOGCTL.LFH.1` e `SQLOGCTL.LFH.2`) em `MEMBER0000/`, alternando a gravação a cada checkpoint (controlado pelo campo `uint16_t update_counter` em `+0x00`):
+
+| Offset | Tamanho | Tipo C | Descrição | Valor em `ERP` (`LFH.1`) |
+| :--- | :--- | :--- | :--- | :--- |
+| `0x0000` | 2 B | `uint16_t` | Contador de atualização (par/ímpar entre `.1` e `.2`) | `126` (`0x007E`) |
+| `0x0002` | 2 B | `uint16_t` | Versão do formato do LFH | `14` (`0x000E`) |
+| `0x000C` | 4 B | `uint32_t` | `Database Seed` (Epoch de criação do banco) | `0x64E2643E` |
+| `0x0010` | 4 B | `uint32_t` | Timestamp da cadeia de logs atual | `0x64E2646D` |
+| `0x0014` | 4 B | `uint32_t` | Timestamp do último Checkpoint | `0x66F13D31` |
+| `0x0034` | 8 B | `uint64_t` | `Current LSO` (Log Sequence Offset atual) | `79320530` (`0x04BA55D2`) |
+| `0x003C` | 8 B | `uint64_t` | `Next Extent StartLSO` | `82400417` (`0x04E954A1`) |
+| `0x0044` | 8 B | `uint64_t` | `Next LSN` (Próximo Log Sequence Number) | `0x000000000007D405` |
+| `0x0088` | 8 B | `uint64_t` | `MinBuffLSN` (Página suja mais antiga nos Bufferpools) | `0x000000000007D405` |
+| `0x0090` | 8 B | `uint64_t` | `LowTranLSN` (Transação ativa mais antiga) | `0x000000000007D405` |
+| `0x00E8` | 8 B | `uint64_t` | `Last Allocated TID` (Último Transaction ID) | `0x000000001FF7` (`8183`) |
+| `0x01C0` | 52 B | `uint32_t[13]` | Vetor circular dos extents de log ativos | `0, 1, 2, ..., 12` |
+| `0x0228` | 8 B | `uint64_t` | `Head LSN` (Início do log ativo para Crash Recovery) | `0x000000000007D405` |
+| `0x025C` | 4 B | `uint32_t` | `LOGPRIMARY` (Quantidade de arquivos primários) | `13` (`S0000000..S0000012.LOG`) |
+
+> **Invariante de Consistência (Clean Shutdown):** Quando `NextLSN == MinBuffLSN == LowTranLSN == HeadLSN` (`0x000000000007D405`), não há páginas sujas pendentes de flush nem transações em aberto, indicando banco perfeitamente consistente em disco.
+
+---
+
+### 8.2. Anatomia Física dos Arquivos de Log (`S000000X.LOG` — 4.202.496 bytes)
+Cada arquivo `S000000X.LOG` possui **1026 páginas de 4096 bytes**:
+1. **Páginas Físicas 0 e 1 (`0x0000..0x1FFF` — 8 KB):** Dois cabeçalhos espelhados de extent com a assinatura `"IBMLOG  "` em `+0x08`, contendo:
+   * `+0x14` (`uint32_t`): Número do Extent (`0` a `12`).
+   * `+0x18` (`uint32_t`): Quantidade de páginas de dados de log (`1024` páginas = `4096 KB`).
+   * `+0x20` (`uint32_t`): Timestamp da cadeia de log (`0x64E26469`).
+   * `+0x24` (`uint32_t`): `Database Seed` (`0x64E2643E`).
+2. **Páginas de Dados de Log (`0x2000` em diante — 1024 páginas de 4096 bytes):**
+   Cada página de log de 4096 bytes possui:
+   * **Header de 16 bytes (`0x00..0x0F`):**
+     * `+0x00` (`uint16_t bytes_in_page`): Bytes úteis gravados na página (máximo `4076 = 0x0FEC`).
+     * `+0x02` (`uint16_t first_rec_offset`): Offset do primeiro registro completo que se inicia nesta página (ou `0xFFFF` se um registro grande atravessa a página inteira).
+     * `+0x04` (`uint16_t page_flags`): Flags da página de log.
+     * `+0x08` (`uint64_t page_end_lso`): Último **LSO (Log Sequence Offset)** contido nesta página.
+   * **Payload de 4076 bytes (`0x10..0xFFB`):** Fatia contígua do fluxo de bytes LSO.
+   * **Trailer de 4 bytes (`0xFFC..0xFFF`):** Checksum de paridade da página de log.
+
+> **Algoritmo de Remontagem do Fluxo LSO (`LSO Stream Reassembly`):**
+> O `start_lso` de uma página de log é dado por `page_end_lso - bytes_in_page + 1`. Páginas consecutivas pertencem à mesma geração do log circular se, e somente se, `start_lso(p) == page_end_lso(p - 1) + 1`. Ao remover os 16 bytes de cabeçalho e os 4 bytes de rodapé de cada página de 4096 bytes e concatenar os blocos de `4076` bytes, reconstrói-se o **fluxo contínuo de bytes (LSO Stream)** onde os registros de transação estão empacotados sem lacunas (inclusive registros que cruzam fronteiras de páginas de 4 KB).
+
+---
+
+### 8.3. Estrutura do Registro de Transação (32B Header + Payload)
+Dentro do fluxo LSO remontado, cada registro possui um cabeçalho fixo de **32 bytes** (`db2_log_rec_hdr_t`):
+
+| Offset | Tamanho | Tipo C | Campo | Descrição |
+| :--- | :--- | :--- | :--- | :--- |
+| `+0x00` | 4 B | `uint32_t` | `rec_len` | Tamanho total do registro em bytes (Header 32B + Payload) |
+| `+0x04` | 2 B | `uint16_t` | `rec_type` | `0x004E` = UNDO/REDO Data/Index, `0x0052` = Internal/Append Page, `0x0084`/`0x0043` = Commit, `0x0082`/`0x0042` = Compensation (CLR) |
+| `+0x06` | 2 B | `uint16_t` | `rec_flags` | Flags de encadeamento/compensação |
+| `+0x08` | 8 B | `uint64_t` | `lsn` | **LSN (Log Sequence Number)** — o mesmo número gravado em `+0x20` (`Page LSN`) das páginas de dados/índices! |
+| `+0x10` | 8 B | `uint64_t` | `tid` | **TID (Transaction ID)** de 6 bytes (`0x00000000157E`, etc.) |
+| `+0x18` | 8 B | `uint64_t` | `prev_lso` | Ponteiro reverso (`LSO`) para o registro anterior da mesma transação (`TID`), usado para `ROLLBACK` |
+
+Principais subtipos decodificados no payload (`offset +32` do registro):
+* **`DOM INSERT ROW` (`rec_type=0x004E`, `comp=0x05`, `sub=0x01`, `op=0xA2`):**
+  * `payload+10` (`uint16_t`): `Tablespace ID` (`4` = `ERPTBS01`)
+  * `payload+12` (`uint16_t`): `Object ID` (`6` = `ERP.ITEM`, `7` = `ERP.CLIENTE`)
+  * `payload+16` (`uint16_t`): `Row Length` (`76` B para `ITEM`, `66` B para `CLIENTE`)
+  * `payload+20` (`uint16_t`): `Target RID Slot`
+  * `payload+22` (`uint32_t`): `Target RID Page`
+  * `payload+28` (`row_len` B): Imagem binária completa da linha inserida (`FIXEDVAR` header + colunas fixas + colunas variáveis)!
+* **`IXM INSERT KEY` (`rec_type=0x004E`, `comp=0x05`, `sub=0x02`, `op=0x65`):**
+  * `payload+10` (`uint16_t`): `Tablespace ID`
+  * `payload+12` (`uint16_t`): `Index Object ID`
+  * `payload+18` (`uint16_t`): `Index ID` (`1`)
+  * `payload+20` (`uint32_t`): `Root Page` (`2`)
+  * `payload+24` (`uint32_t`): `Target Leaf Page`
+  * `payload+40` (`uint16_t`): `Target RID Slot`
+  * `payload+42` (`uint32_t`): `Target RID Page`
+  * `payload+54` (`uint16_t`): `Key Length`
+  * `payload+56`: Bytes exatos da chave indexada em Little-Endian.
+* **`DOM APPEND PAGE / UPDATE PAGE 0 SLOT 0` (`rec_type=0x0052`, `comp=0x05`, `sub=0x01`, `op=0x85`):**
+  * Emitido sempre que uma nova página de dados é anexada ao final da tabela, atualizando o contador `PageCount` no **Slot 0 da Página 0** da tabela e carimbando o `Page LSN` da Página 0.
+
+---
+
+### 8.4. Prova de Correlação Direta: `Page LSN` na Tabela $\leftrightarrow$ Registro no `S0000003.LOG`
+Ao inspecionar a **Página 0** das tabelas `ERP.ITEM` (`ObjID=6`, `PageCount=981` páginas `0..980`) e `ERP.CLIENTE` (`ObjID=7`, `PageCount=86` páginas `0..85`) no container `C0000000.LRG`, observamos os seguintes `Page LSN` no cabeçalho BPS (`+0x20`):
+* `ERP.ITEM` (Página 0): **`Page LSN = 0x000000000006302B`**
+* `ERP.CLIENTE` (Página 0): **`Page LSN = 0x0000000000065CB9`**
+
+Buscando esses exatos LSNs dentro de `S0000003.LOG` com `./db2_inspector --log`:
+1. **`LSN = 0x000000000006302B` (`LogPg=66+0x4A3` em `S0000003.LOG`):**
+   * Imediatamente após o `DOM INSERT` (`0x63029`) e `IXM INSERT` (`0x6302A`) do `Item 49952` no último slot da **Página 979 (`Slot 50`)**, o registro `0x6302B` executa `DMS DOM APPEND PAGE (Op=0x85)` em `Tablespace=4 | ObjectID=6 | Param1=980`, anexando a **Página 980** (a 981ª e última página de `ERP.ITEM`) e atualizando o Slot 0 da **Página 0**! No registro seguinte (`0x6302C`), o `Item 49953` é inserido em `Page=980 : Slot=0`.
+2. **`LSN = 0x0000000000065CB9` (`LogPg=386+0x530` em `S0000003.LOG`):**
+   * Imediatamente após o `DOM INSERT` (`0x65CB7`) e `IXM INSERT` (`0x65CB8`) do `Cliente 4997` no último slot da **Página 84 (`Slot 58`)**, o registro `0x65CB9` executa `DMS DOM APPEND PAGE (Op=0x85)` em `Tablespace=4 | ObjectID=7 | Param1=85`, anexando a **Página 85** (a 86ª e última página de `ERP.CLIENTE`) e atualizando o Slot 0 da **Página 0**! No registro seguinte (`0x65CBA`), o `Cliente 4998` é inserido em `Page=85 : Slot=0`.
+
+---
+
+## 9. Ferramenta Completa Desenvolvida em C (`db2_inspector.c`)
 
 * **Código-fonte:** [`/desenv/db2/db2_inspector.c`](file:///desenv/db2/db2_inspector.c)
 * **Build:** [`/desenv/db2/Makefile`](file:///desenv/db2/Makefile) (`make` $\rightarrow$ gera `/desenv/db2/db2_inspector`)
@@ -242,19 +338,23 @@ Todos os índices de uma tabela residem no mesmo Objeto de Índice (`Type = 0x01
 # 1. Decodificar o arquivo de controle SQLSPCS.1 (mostra as 5 tablespaces, incluindo USERSPACE1 deletada)
 ./db2_inspector --sqlspcs /db2data_erp/db/erp/NODE0000/SQL00001/SQLSPCS.1
 
-# 2. Inspecionar toda a tablespace ERPTBS01 (Tag, SMP, Object Table, Dados e Índices das 4 tabelas)
+# 2. Decodificar o cabeçalho de controle de Transaction Log (SQLOGCTL.LFH.1)
+./db2_inspector --lfh /db2data_erp/db/erp/NODE0000/SQL00001/MEMBER0000/SQLOGCTL.LFH.1
+
+# 3. Decodificar registros de transação (DOM INSERT + IXM INSERT) em S0000002.LOG
+./db2_inspector --log /db2data_erp/db/erp/NODE0000/SQL00001/LOGSTREAM0000/S0000002.LOG 0 6
+
+# 4. Rastrear no S0000003.LOG os exatos LSNs gravados na Página 0 de ERP.ITEM (0x6302B) e ERP.CLIENTE (0x65CB9)
+./db2_inspector --log /db2data_erp/db/erp/NODE0000/SQL00001/LOGSTREAM0000/S0000003.LOG 0x63029 4
+./db2_inspector --log /db2data_erp/db/erp/NODE0000/SQL00001/LOGSTREAM0000/S0000003.LOG 0x65CB7 4
+
+# 5. Inspecionar toda a tablespace ERPTBS01 (Tag, SMP, Object Table, Dados e Índices das 4 tabelas)
 ./db2_inspector /db2data_erp/data/erp/NODE0000/ERP/T0000004/C0000000.LRG
 
-# 3. Inspecionar a tabela ERP.ITEM (ObjID 6: 31 extents de dados, 981 págs, 50.000 linhas + B+Tree de 3 níveis, 265 folhas, 50.000 chaves)
+# 6. Inspecionar a tabela ERP.ITEM (ObjID 6: 31 extents de dados, 981 págs, 50.000 linhas + B+Tree de 3 níveis, 265 folhas, 50.000 chaves)
 ./db2_inspector /db2data_erp/data/erp/NODE0000/ERP/T0000004/C0000000.LRG 6 10
 
-# 4. Inspecionar diretamente o catálogo SYSIBM.SYSTABLES (ObjID 5: 61 págs, 437 linhas) e SYSIBM.SYSCOLUMNS (ObjID 6: 368 págs, 6.247 linhas)
+# 7. Inspecionar diretamente o catálogo SYSIBM.SYSTABLES (ObjID 5: 61 págs, 437 linhas) e SYSIBM.SYSCOLUMNS (ObjID 6: 368 págs, 6.247 linhas)
 ./db2_inspector /db2data_erp/data/catalog.dat 5 10
 ./db2_inspector /db2data_erp/data/catalog.dat 6 10
 ```
-
----
-
-## 9. Próxima Etapa: Transaction Logs (`LOGSTREAM0000` e `SQLOGCTL.LFH`)
-
-* Decodificação binária de `SQLOGCTL.LFH.1` / `SQLOGCTL.GLFH.1` e dos arquivos `S0000000.LOG` .. `S0000012.LOG` (cabeçalho `IBMLOG`, páginas de log de 4 KB, LSNs, LSOs e registros de transação DOM/BPS/UNDO/REDO/COMMIT).

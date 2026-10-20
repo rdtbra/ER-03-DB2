@@ -105,6 +105,24 @@ typedef struct {
     uint16_t null_flags;            /* +0x0A: 0x0002 = Prohibits NULLs, 0x0001 = Allows NULLs */
 } db2_idx_keypart_t;
 
+/* Cabeçalho de 16 bytes de cada página de 4KB de Transaction Log (a partir do offset 0x2000 do .LOG) */
+typedef struct {
+    uint16_t bytes_in_page;         /* +0x00: Bytes usados no payload da página (máx 0x0FEC = 4076 bytes) */
+    uint16_t first_rec_offset;      /* +0x02: Offset (relativo a +0x10) do 1º registro que inicia nesta página */
+    uint32_t page_flags;            /* +0x04 */
+    uint64_t page_end_lso;          /* +0x08: LSO (Log Stream Offset) do último byte válido desta página */
+} db2_log_page_hdr_t;
+
+/* Cabeçalho comum de 32 bytes (0x20) de todo Registro de Log no fluxo contínuo de LSO */
+typedef struct {
+    uint32_t rec_len;               /* +0x00: Tamanho total do registro de log em bytes */
+    uint16_t rec_type;              /* +0x04: 0x004E=Undo/Redo, 0x0084/0x0043=Commit, 0x0041=Abort, 0x0052=Internal */
+    uint16_t rec_flags;             /* +0x06: Flags do registro */
+    uint64_t lsn;                   /* +0x08: Log Sequence Number (mesmo valor gravado no Page LSN da página!) */
+    uint64_t tid;                   /* +0x10: Transaction ID (TID) */
+    uint64_t prev_lso;              /* +0x18: LSO do registro anterior da mesma transação (0 = 1º registro do TID) */
+} db2_log_rec_hdr_t;
+
 #pragma pack(pop)
 
 typedef struct {
@@ -997,13 +1015,330 @@ static int inspect_sqlspcs_file(const char *path) {
     return 0;
 }
 
+/* 7. Decodifica o arquivo binário de controle de Log (SQLOGCTL.LFH.1 / .2) */
+static int inspect_lfh_file(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "Erro ao abrir '%s': %s\n", path, strerror(errno));
+        return 1;
+    }
+
+    uint8_t buf[4096];
+    size_t nread = fread(buf, 1, sizeof(buf), fp);
+    fclose(fp);
+    if (nread < 1024) {
+        fprintf(stderr, "Arquivo LFH muito pequeno (%zu bytes).\n", nread);
+        return 1;
+    }
+
+    uint16_t write_counter  = *(const uint16_t *)(buf + 0x0000);
+    uint16_t lfh_version    = *(const uint16_t *)(buf + 0x0002);
+    uint32_t db_seed_ts     = *(const uint32_t *)(buf + 0x0004);
+    uint64_t next_ext_lso   = *(const uint64_t *)(buf + 0x0018);
+    uint64_t next_lsn       = *(const uint64_t *)(buf + 0x0020);
+    uint64_t min_buff_lsn   = *(const uint64_t *)(buf + 0x0028);
+    uint64_t low_tran_lsn   = *(const uint64_t *)(buf + 0x0030);
+    uint32_t last_ckpt_ts   = *(const uint32_t *)(buf + 0x0040);
+    uint32_t log_chain_ts   = *(const uint32_t *)(buf + 0x0044);
+    uint64_t current_lso    = *(const uint64_t *)(buf + 0x01D0);
+    uint64_t head_lsn       = *(const uint64_t *)(buf + 0x0228);
+    uint64_t last_tid       = *(const uint64_t *)(buf + 0x0230);
+    uint32_t log_primary    = *(const uint32_t *)(buf + 0x025C);
+    const uint32_t *ext_arr = (const uint32_t *)(buf + 0x0260);
+
+    printf("================================================================================\n");
+    printf(" ENGENHARIA REVERSA DO LOG FILE HEADER (%s)\n", path);
+    printf("================================================================================\n");
+    printf("  Contador de Escrita  : %u (0x%04X — alterna entre LFH.1 e LFH.2)\n", write_counter, write_counter);
+    printf("  Versão da Estrutura  : %u (0x%04X)\n", lfh_version, lfh_version);
+    printf("  Database Seed (Epoch): 0x%08X (%u)\n", db_seed_ts, db_seed_ts);
+    printf("  Log Chain Timestamp  : 0x%08X (%u)\n", log_chain_ts, log_chain_ts);
+    printf("  Último Checkpoint TS : 0x%08X (%u)\n", last_ckpt_ts, last_ckpt_ts);
+    printf("  Current LSO          : %llu (0x%016llX)\n",
+           (unsigned long long)current_lso, (unsigned long long)current_lso);
+    printf("  Next Extent StartLSO : %llu (0x%016llX)\n",
+           (unsigned long long)next_ext_lso, (unsigned long long)next_ext_lso);
+    printf("  Next LSN             : 0x%016llX\n", (unsigned long long)next_lsn);
+    printf("  MinBuffLSN (DirtyPg) : 0x%016llX\n", (unsigned long long)min_buff_lsn);
+    printf("  LowTranLSN (OldestTx): 0x%016llX\n", (unsigned long long)low_tran_lsn);
+    printf("  Head LSN (+0x228)    : 0x%016llX\n", (unsigned long long)head_lsn);
+    printf("   Estado de Recovery  : %s\n",
+           (next_lsn == min_buff_lsn && next_lsn == low_tran_lsn)
+           ? "CONSISTENTE (Clean Shutdown — NextLSN == MinBuffLSN == LowTranLSN)"
+           : "CRASH RECOVERY NECESSÁRIO (Páginas sujas ou transações ativas pendentes)");
+    printf("  Último TID Alocado   : 0x%012llX (%llu)\n",
+           (unsigned long long)last_tid, (unsigned long long)last_tid);
+    printf("  LOGPRIMARY (+0x25C)  : %u arquivos de log primários\n", log_primary);
+    printf("  Cadeia Circular Ativa: ");
+    for (uint32_t i = 0; i < log_primary && i < 32; i++) {
+        printf("S%07u.LOG ", ext_arr[i]);
+    }
+    printf("\n\n");
+    return 0;
+}
+
+static const char *log_rec_type_desc(uint16_t rec_type, const uint8_t *payload, uint32_t payload_len) {
+    if (rec_type == 0x0084 || rec_type == 0x0043) return "NORMAL COMMIT";
+    if (rec_type == 0x0041) return "ABORT / ROLLBACK";
+    if (rec_type == 0x0082 || rec_type == 0x0042) return "COMPENSATION (CLR / UNDO)";
+    if ((rec_type == 0x004E || rec_type == 0x0052) && payload_len >= 12) {
+        uint8_t comp_id  = payload[4];
+        uint8_t sub_comp = payload[8];
+        uint8_t op_code  = payload[9];
+        if (comp_id == 0x05 && sub_comp == 0x01 && op_code == 0xA2) return "DMS DOM INSERT ROW";
+        if (comp_id == 0x05 && sub_comp == 0x01 && op_code == 0xA3) return "DMS DOM DELETE ROW";
+        if (comp_id == 0x05 && sub_comp == 0x01 && op_code == 0xA4) return "DMS DOM UPDATE ROW";
+        if (comp_id == 0x05 && sub_comp == 0x01 && op_code == 0x85) return "DMS DOM APPEND PAGE (Update Page0 Slot0)";
+        if (comp_id == 0x05 && sub_comp == 0x02 && op_code == 0x65) return "DMS IXM INSERT KEY (B+Tree)";
+        if (comp_id == 0x05 && sub_comp == 0x02 && op_code == 0x66) return "DMS IXM DELETE KEY (B+Tree)";
+        if (comp_id == 0x05) return "DMS DATA/SPACE OP";
+    }
+    if (rec_type == 0x0052) return "INTERNAL / LOG SYNC";
+    return "UNDO/REDO RECORD";
+}
+
+/* 8. Decodifica um arquivo de Transaction Log (S000000X.LOG) e busca por LSN opcional */
+static int inspect_log_file(const char *path, uint64_t target_lsn, uint32_t max_recs_to_print) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "Erro ao abrir '%s': %s\n", path, strerror(errno));
+        return 1;
+    }
+
+    fseek(fp, 0, SEEK_END);
+    uint64_t fsize = (uint64_t)ftell(fp);
+    if (fsize < 3 * DB2_PAGE_SIZE) {
+        fprintf(stderr, "Arquivo de log inválido (< 12 KB).\n");
+        fclose(fp);
+        return 1;
+    }
+
+    /* Lê os 2 cabeçalhos espelhados de 4KB (IBMLOG em 0x0000 e 0x1000) */
+    uint8_t hdr0[DB2_PAGE_SIZE];
+    fseek(fp, 0, SEEK_SET);
+    if (fread(hdr0, 1, DB2_PAGE_SIZE, fp) != DB2_PAGE_SIZE) {
+        fclose(fp);
+        return 1;
+    }
+
+    char magic[9] = {0};
+    memcpy(magic, hdr0 + 0x08, 8);
+    uint16_t hdr_upd_cnt  = *(const uint16_t *)(hdr0 + 0x00);
+    uint16_t hdr_ver      = *(const uint16_t *)(hdr0 + 0x02);
+    uint32_t extent_num   = *(const uint32_t *)(hdr0 + 0x14);
+    uint32_t log_pages    = *(const uint32_t *)(hdr0 + 0x18);
+    uint32_t chain_ts     = *(const uint32_t *)(hdr0 + 0x20);
+    uint32_t db_seed      = *(const uint32_t *)(hdr0 + 0x24);
+    uint64_t hdr_lso      = *(const uint64_t *)(hdr0 + 0x44);
+
+    printf("================================================================================\n");
+    printf(" ENGENHARIA REVERSA DE TRANSACTION LOG (%s)\n", path);
+    printf("================================================================================\n");
+    printf("  Assinatura (0x08)    : \"%s\" (FormatVer=%u, UpdCounter=%u)\n", magic, hdr_ver, hdr_upd_cnt);
+    printf("  Número do Extent     : %u (S%07u.LOG)\n", extent_num, extent_num);
+    printf("  Tamanho Configurado  : %u páginas de 4KB (%u KB de dados + 8 KB de header IBMLOG)\n",
+           log_pages, (log_pages * DB2_PAGE_SIZE) / 1024);
+    printf("  DB Seed / Chain TS   : Seed=0x%08X | ChainTS=0x%08X | HeaderLSO=%llu\n",
+           db_seed, chain_ts, (unsigned long long)hdr_lso);
+
+    /*
+     * Remonta o fluxo contínuo de bytes (Log Stream) concatenando os payloads (máx 4076 bytes)
+     * de todas as páginas de log pertencentes à sequência contínua de LSO a partir da página 0.
+     */
+    uint32_t total_data_pages = (uint32_t)((fsize - 2 * DB2_PAGE_SIZE) / DB2_PAGE_SIZE);
+    uint8_t *stream_buf = (uint8_t *)malloc((size_t)total_data_pages * 4076);
+    if (!stream_buf) {
+        fclose(fp);
+        return 1;
+    }
+
+    uint64_t stream_len       = 0;
+    uint64_t page0_start_lso  = 0;
+    uint16_t page0_first_off  = 0;
+    uint64_t prev_end_lso     = 0;
+    uint32_t active_pages     = 0;
+
+    uint8_t pg_buf[DB2_PAGE_SIZE];
+    for (uint32_t p = 0; p < total_data_pages; p++) {
+        fseek(fp, (long)((2 + p) * DB2_PAGE_SIZE), SEEK_SET);
+        if (fread(pg_buf, 1, DB2_PAGE_SIZE, fp) != DB2_PAGE_SIZE) break;
+
+        const db2_log_page_hdr_t *phdr = (const db2_log_page_hdr_t *)pg_buf;
+        if (phdr->bytes_in_page == 0 || phdr->bytes_in_page > 4076) break;
+
+        uint64_t pg_start_lso = phdr->page_end_lso - phdr->bytes_in_page + 1;
+        if (p == 0) {
+            page0_start_lso = pg_start_lso;
+            page0_first_off = phdr->first_rec_offset;
+        } else {
+            /* Se o LSO não for contíguo à página anterior, atingimos o fim do log ativo neste arquivo */
+            if (pg_start_lso != prev_end_lso + 1) break;
+        }
+
+        memcpy(stream_buf + stream_len, pg_buf + 0x10, phdr->bytes_in_page);
+        stream_len   += phdr->bytes_in_page;
+        prev_end_lso  = phdr->page_end_lso;
+        active_pages++;
+    }
+
+    if (active_pages == 0) {
+        printf("  Status do Arquivo    : VAZIO / NÃO UTILIZADO (0 páginas ativas)\n\n");
+        free(stream_buf);
+        fclose(fp);
+        return 0;
+    }
+
+    printf("  Páginas Ativas Lidas : %u página(s) contíguas (%llu bytes de fluxo LSO)\n",
+           active_pages, (unsigned long long)stream_len);
+    printf("  Faixa de LSO do Arq. : StartLSO = %llu (0x%012llX) .. EndLSO = %llu (0x%012llX)\n",
+           (unsigned long long)page0_start_lso, (unsigned long long)page0_start_lso,
+           (unsigned long long)prev_end_lso, (unsigned long long)prev_end_lso);
+    printf("  Offset 1º Registro   : +%u bytes (0x%04X na Log Page 0)\n\n",
+           page0_first_off, page0_first_off);
+
+    uint64_t pos          = page0_first_off;
+    uint64_t total_recs   = 0;
+    uint64_t commit_recs  = 0;
+    uint64_t dom_ins_recs = 0;
+    uint64_t ixm_ins_recs = 0;
+    uint64_t first_lsn    = 0;
+    uint64_t last_lsn     = 0;
+    uint32_t printed      = 0;
+
+    if (target_lsn != 0) {
+        printf("  --- Buscando Registro de Log com LSN = 0x%016llX ---\n",
+               (unsigned long long)target_lsn);
+    } else {
+        printf("  --- Primeiros %u Registros de Transação no Fluxo LSO ---\n", max_recs_to_print);
+    }
+
+    while (pos + sizeof(db2_log_rec_hdr_t) <= stream_len) {
+        const db2_log_rec_hdr_t *rhdr = (const db2_log_rec_hdr_t *)(stream_buf + pos);
+        if (rhdr->rec_len < sizeof(db2_log_rec_hdr_t) || pos + rhdr->rec_len > stream_len) {
+            break;
+        }
+
+        uint64_t rec_lso = page0_start_lso + pos;
+        uint32_t log_pg  = (uint32_t)(pos / 4076);
+        uint32_t pg_off  = 0x10 + (uint32_t)(pos % 4076);
+
+        const uint8_t *payload = stream_buf + pos + sizeof(db2_log_rec_hdr_t);
+        uint32_t payload_len   = rhdr->rec_len - (uint32_t)sizeof(db2_log_rec_hdr_t);
+
+        if (total_recs == 0) first_lsn = rhdr->lsn;
+        last_lsn = rhdr->lsn;
+        total_recs++;
+
+        if (rhdr->rec_type == 0x0084 || rhdr->rec_type == 0x0043) commit_recs++;
+        else if (rhdr->rec_type == 0x004E && payload_len >= 12 && payload[4] == 0x05) {
+            if (payload[8] == 0x01 && payload[9] == 0xA2) dom_ins_recs++;
+            else if (payload[8] == 0x02 && payload[9] == 0x65) ixm_ins_recs++;
+        }
+
+        bool should_print = (target_lsn != 0)
+            ? (rhdr->lsn >= target_lsn && printed < max_recs_to_print)
+            : (printed < max_recs_to_print);
+
+        if (should_print) {
+            printed++;
+            const char *desc = log_rec_type_desc(rhdr->rec_type, payload, payload_len);
+            printf("  [Rec #%llu | LogPg=%4u+0x%03X] LSN=0x%012llX | LSO=%llu | PrevLSO=%llu\n",
+                   (unsigned long long)total_recs, log_pg, pg_off,
+                   (unsigned long long)rhdr->lsn,
+                   (unsigned long long)rec_lso,
+                   (unsigned long long)rhdr->prev_lso);
+            printf("    TID=0x%012llX | Type=0x%04X (%s) | Flags=0x%04X | Len=%u B\n",
+                   (unsigned long long)rhdr->tid, rhdr->rec_type, desc,
+                   rhdr->rec_flags, rhdr->rec_len);
+
+            /* Decodifica detalhes específicos do payload */
+            if ((rhdr->rec_type == 0x0084 || rhdr->rec_type == 0x0043) && payload_len >= 12) {
+                uint32_t commit_ts = *(const uint32_t *)(payload + 8);
+                printf("    >> [COMMIT] Timestamp Epoch = 0x%08X (%u)\n", commit_ts, commit_ts);
+            } else if (rhdr->rec_type == 0x004E && payload_len >= 28 &&
+                       payload[4] == 0x05 && payload[8] == 0x01 && payload[9] == 0xA2) {
+                /* DMS DOM Insert Row */
+                uint16_t tbsp_id  = *(const uint16_t *)(payload + 10);
+                uint16_t obj_id   = *(const uint16_t *)(payload + 12);
+                uint16_t row_len  = *(const uint16_t *)(payload + 16);
+                uint16_t rid_slot = *(const uint16_t *)(payload + 20);
+                uint32_t rid_page = *(const uint32_t *)(payload + 22);
+                printf("    >> [DOM INSERT] Tablespace=%u | ObjectID=%u | Target RID=(Page=%u : Slot=%u) | RowLen=%u B\n",
+                       tbsp_id, obj_id, rid_page, rid_slot, row_len);
+
+                if (payload_len >= 28u + row_len && row_len >= 12) {
+                    const uint8_t *row_img = payload + 28;
+                    printf("    >> [ROW IMAGE ] Header=(type=0x%04X len=%u flags=0x%04X fixlen=%u) ASCII=\"",
+                           *(const uint16_t *)(row_img + 0),
+                           *(const uint16_t *)(row_img + 2),
+                           *(const uint16_t *)(row_img + 4),
+                           *(const uint16_t *)(row_img + 6));
+                    for (uint16_t b = 8; b < row_len && b < 72; b++) {
+                        uint8_t ch = row_img[b];
+                        putchar(isprint(ch) ? ch : '.');
+                    }
+                    printf("\"\n");
+                }
+            } else if (rhdr->rec_type == 0x004E && payload_len >= 56 &&
+                       payload[4] == 0x05 && payload[8] == 0x02 && payload[9] == 0x65) {
+                /* DMS IXM Insert Key */
+                uint16_t idx_tbsp  = *(const uint16_t *)(payload + 10);
+                uint16_t idx_obj   = *(const uint16_t *)(payload + 12);
+                uint16_t index_id  = *(const uint16_t *)(payload + 18);
+                uint32_t root_pg   = *(const uint32_t *)(payload + 20);
+                uint32_t leaf_pg   = *(const uint32_t *)(payload + 24);
+                uint16_t rid_slot  = *(const uint16_t *)(payload + 40);
+                uint32_t rid_page  = *(const uint32_t *)(payload + 42);
+                uint16_t key_len   = *(const uint16_t *)(payload + 54);
+                printf("    >> [IXM INSERT] Tbsp=%u | ObjID=%u | IndexID=%u (RootPg=%u, LeafPg=%u) ==> Target RID=(Page=%u : Slot=%u)\n",
+                       idx_tbsp, idx_obj, index_id, root_pg, leaf_pg, rid_page, rid_slot);
+                if (payload_len >= 56u + (key_len > 2 ? (uint32_t)(key_len - 2) : 0u) && key_len > 2) {
+                    printf("    >> [KEY BYTES ] ");
+                    for (uint16_t b = 0; b < key_len - 2 && b < 24; b++) {
+                        printf("%02X ", payload[56 + b]);
+                    }
+                    printf("\n");
+                }
+            } else if (payload_len >= 24 && payload[4] == 0x05) {
+                /* Outros registros DMS (ex: Op=0x85 Update Page Count / Slot 0 na Página 0) */
+                uint16_t tbsp_id  = *(const uint16_t *)(payload + 10);
+                uint16_t obj_id   = *(const uint16_t *)(payload + 12);
+                uint32_t new_pg   = *(const uint32_t *)(payload + 16);
+                uint32_t meta_val = *(const uint32_t *)(payload + 20);
+                printf("    >> [DMS OP    ] Comp=0x%02X Sub=0x%02X Op=0x%02X | Tablespace=%u | ObjectID=%u | Param1=%u | Param2=%u\n",
+                       payload[4], payload[8], payload[9], tbsp_id, obj_id, new_pg, meta_val);
+            }
+            printf("\n");
+        }
+
+        pos += rhdr->rec_len;
+    }
+
+    printf("  ==============================================================================\n");
+    printf("   RESUMO DO ARQUIVO DE LOG (%s)\n", path);
+    printf("  ==============================================================================\n");
+    printf("  Faixa de LSN         : 0x%012llX .. 0x%012llX\n",
+           (unsigned long long)first_lsn, (unsigned long long)last_lsn);
+    printf("  Total de Registros   : %llu registros decodificados\n", (unsigned long long)total_recs);
+    printf("  Operações Contadas   : %llu DOM Inserts (Tabela) | %llu IXM Inserts (Índice) | %llu Commits\n\n",
+           (unsigned long long)dom_ins_recs, (unsigned long long)ixm_ins_recs, (unsigned long long)commit_recs);
+
+    free(stream_buf);
+    fclose(fp);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "Uso:\n");
         fprintf(stderr, "  1) Inspecionar Container (Tag, SMP, Object Table, Dados e Índices B+Tree):\n");
         fprintf(stderr, "     %s <caminho_do_container> [object_id] [max_rows]\n", argv[0]);
         fprintf(stderr, "  2) Inspecionar Arquivo de Controle de Tablespaces (SQLSPCS.1 / SQLSPCS.2):\n");
-        fprintf(stderr, "     %s --sqlspcs <caminho_do_SQLSPCS>\n", argv[0]);
+        fprintf(stderr, "     %s --sqlspcs [caminho_do_SQLSPCS]\n", argv[0]);
+        fprintf(stderr, "  3) Inspecionar Cabeçalho de Controle de Logs (SQLOGCTL.LFH.1 / .2):\n");
+        fprintf(stderr, "     %s --lfh [caminho_do_SQLOGCTL.LFH.1]\n", argv[0]);
+        fprintf(stderr, "  4) Inspecionar Arquivo de Transaction Log (S000000X.LOG) ou buscar LSN específico:\n");
+        fprintf(stderr, "     %s --log <caminho_do_S000000X.LOG> [lsn_hex_ou_0] [max_recs]\n", argv[0]);
         return 1;
     }
 
@@ -1012,6 +1347,22 @@ int main(int argc, char **argv) {
             ? argv[2]
             : "/db2data_erp/db/erp/NODE0000/SQL00001/SQLSPCS.1";
         return inspect_sqlspcs_file(spcs_path);
+    }
+
+    if (strcmp(argv[1], "--lfh") == 0) {
+        const char *lfh_path = (argc >= 3)
+            ? argv[2]
+            : "/db2data_erp/db/erp/NODE0000/SQL00001/MEMBER0000/SQLOGCTL.LFH.1";
+        return inspect_lfh_file(lfh_path);
+    }
+
+    if (strcmp(argv[1], "--log") == 0) {
+        const char *log_path = (argc >= 3)
+            ? argv[2]
+            : "/db2data_erp/db/erp/NODE0000/SQL00001/LOGSTREAM0000/S0000002.LOG";
+        uint64_t target_lsn = (argc >= 4) ? strtoull(argv[3], NULL, 0) : 0;
+        uint32_t max_recs   = (argc >= 5) ? (uint32_t)atoi(argv[4]) : 8;
+        return inspect_log_file(log_path, target_lsn, max_recs);
     }
 
     db2_container_t ctx;

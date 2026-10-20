@@ -13,11 +13,14 @@ Repositório de estudo prático e engenharia reversa das estruturas internas do 
   * Decodificação de registros `FIXEDVAR` (`SMALLINT`, `INTEGER`, `BIGINT`, `CHAR`, `VARCHAR`, `DATE` em Packed BCD, `TIMESTAMP` em Packed BCD, `BLOB`/`CLOB`, além de registros de *Overflow Pointer* `0x0042` e *Overflow Target* `0x00C4`).
 * **Objetos de Índice B+Tree (`Type = 0x01`):**
   * *Index SMP* (`ObjPg 0`), *MetaIndex* (`ObjPg 1`), *Index Root Vector* (`"RT10"`), *Info Page* (`ObjPg 3`), descida multinível pela árvore B+ (*Root $\rightarrow$ Internal $\rightarrow$ Leaf*) e travessia da cadeia duplamente encadeada de páginas folha (*Leaf Chain*) extraindo chaves e ponteiros `RID(Page:Slot)`.
+* **Controle de Logs e Transaction Logs (`SQLOGCTL.LFH.1` e `S000000X.LOG`):**
+  * Decodificação do *Log File Header* (`SQLOGCTL.LFH.1`/`.2`), verificando `NextLSN`, `MinBuffLSN`, `LowTranLSN`, `CurrentLSO`, `LastTID` e a cadeia circular de arquivos `LOGPRIMARY`.
+  * Remontagem do fluxo contínuo de bytes (*LSO Stream*) a partir das páginas de log de 4 KB (`IBMLOG`, 16B header + 4076B payload + 4B checksum), decodificando registros `DOM INSERT`, `IXM INSERT`, `DOM APPEND PAGE` (`Op=0x85`), `COMMIT` e correlacionando o `Page LSN` das páginas de dados diretamente ao registro no arquivo `.LOG`.
 
 ## Estrutura do Repositório
 
 * [`DOCUMENTACAO_ENGENHARIA_REVERSA_DB2.md`](DOCUMENTACAO_ENGENHARIA_REVERSA_DB2.md): Documentação técnica detalhada de toda a investigação e mapeamento de bytes/offsets.
-* [`db2_inspector.c`](db2_inspector.c): Ferramenta em C para inspeção direta de containers, páginas de dados, árvores B+ de índices e arquivos `SQLSPCS.1`.
+* [`db2_inspector.c`](db2_inspector.c): Ferramenta em C para inspeção direta de containers, páginas de dados, árvores B+ de índices, arquivos `SQLSPCS.1`, `SQLOGCTL.LFH.1` e Transaction Logs (`S000000X.LOG`).
 * [`Makefile`](Makefile): Script de compilação (`gcc -O2 -Wall -Wextra -std=c11`).
 
 ## Compilação e Uso
@@ -28,12 +31,19 @@ make
 # 1. Inspecionar o arquivo binário de controle de tablespaces (SQLSPCS.1)
 ./db2_inspector --sqlspcs /db2data_erp/db/erp/NODE0000/SQL00001/SQLSPCS.1
 
-# 2. Inspecionar um container completo (Tag, SMP, Object Table, Tabelas e Índices B+Tree)
+# 2. Inspecionar o cabeçalho de controle de Transaction Log (SQLOGCTL.LFH.1)
+./db2_inspector --lfh /db2data_erp/db/erp/NODE0000/SQL00001/MEMBER0000/SQLOGCTL.LFH.1
+
+# 3. Decodificar um arquivo de Transaction Log (ex: S0000002.LOG ou buscando um LSN específico em S0000003.LOG)
+./db2_inspector --log /db2data_erp/db/erp/NODE0000/SQL00001/LOGSTREAM0000/S0000002.LOG 0 6
+./db2_inspector --log /db2data_erp/db/erp/NODE0000/SQL00001/LOGSTREAM0000/S0000003.LOG 0x63029 4
+
+# 4. Inspecionar um container completo (Tag, SMP, Object Table, Tabelas e Índices B+Tree)
 ./db2_inspector /db2data_erp/data/erp/NODE0000/ERP/T0000004/C0000000.LRG
 
-# 3. Inspecionar um Object ID específico (ex: 6 = ERP.ITEM, exibindo as primeiras 10 linhas/chaves)
+# 5. Inspecionar um Object ID específico (ex: 6 = ERP.ITEM, exibindo as primeiras 10 linhas/chaves)
 ./db2_inspector /db2data_erp/data/erp/NODE0000/ERP/T0000004/C0000000.LRG 6 10
 
-# 4. Inspecionar tabelas do catálogo do sistema diretamente no catalog.dat (ex: 5 = SYSIBM.SYSTABLES)
+# 6. Inspecionar tabelas do catálogo do sistema diretamente no catalog.dat (ex: 5 = SYSIBM.SYSTABLES)
 ./db2_inspector /db2data_erp/data/catalog.dat 5 10
 ```
