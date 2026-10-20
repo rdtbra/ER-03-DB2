@@ -461,40 +461,85 @@ static bool scan_table_object(const container_ctx_t *ctx, uint16_t target_obj_id
     return true;
 }
 
-/* 1. Resolve <BANCO> nos arquivos binários sqldbdir -> diretório de controle SQL0000X */
+/* 1. Resolve <BANCO> a partir de /var/db2/global.reg -> sqldbdir -> SQL0000X -> SQLSGF.1 */
 static bool resolve_database_paths(const char *db_name, char *out_ctrl_dir, size_t ctrl_sz,
                                    char *out_inst_name, size_t inst_sz,
                                    char *out_storage_path, size_t stor_sz) {
-    char db_root[256] = "/db2data_erp/db/erp";
-    snprintf(out_inst_name, inst_sz, "erp");
+    out_ctrl_dir[0]     = '\0';
+    out_inst_name[0]    = '\0';
+    out_storage_path[0] = '\0';
 
-    FILE *fp = fopen("/home/erp/sqllib/sqldbdir/sqldbdir", "rb");
-    if (fp) {
-        uint8_t buf[4096];
-        size_t n = fread(buf, 1, sizeof(buf), fp);
-        fclose(fp);
-        if (n >= 0x200 && memcmp(buf, "DB2 DIRECTORY", 13) == 0) {
-            uint32_t num_entries = *(const uint32_t *)(buf + 0x14);
-            uint32_t entry_off   = *(const uint32_t *)(buf + 0x34);
-            for (uint32_t i = 0; i < num_entries && entry_off + 0x150 <= n; i++, entry_off += 0x518) {
-                const char *alias = (const char *)(buf + entry_off + 0x00);
-                const char *name  = (const char *)(buf + entry_off + 0x09);
-                const char *path  = (const char *)(buf + entry_off + 0x26);
-                if (db2_name_eq(alias, db_name) || db2_name_eq(name, db_name)) {
-                    snprintf(db_root, sizeof(db_root), "%s", path);
-                    const char *slash = strrchr(db_root, '/');
-                    if (slash && slash[1]) snprintf(out_inst_name, inst_sz, "%s", slash + 1);
-                    break;
+    /* 1.1 Varre o registro binário global (/var/db2/global.reg) procurando registros de Instância (type == 1) */
+    FILE *gfp = fopen("/var/db2/global.reg", "rb");
+    if (!gfp) return false;
+
+    uint8_t greg[8192];
+    size_t gsize = fread(greg, 1, sizeof(greg), gfp);
+    fclose(gfp);
+
+    char sqllib_path[256] = "";
+    char db_root[256]     = "";
+
+    size_t off = 0;
+    while (off + 0x20 <= gsize) {
+        uint32_t rec_len  = *(const uint32_t *)(greg + off + 0x00);
+        uint32_t rec_type = *(const uint32_t *)(greg + off + 0x04);
+        if (rec_len < 0x1C || off + 4 + rec_len > gsize) break;
+
+        if (rec_type == 1) { /* Registro de Instância (I) */
+            size_t pos = off + 0x18;
+            /* Campo 1: Produto ("DB2\0") */
+            uint16_t prod_len = *(const uint16_t *)(greg + pos);
+            pos += 2 + prod_len;
+            /* Campo 2: Versão binária (8 bytes) */
+            uint16_t ver_len = *(const uint16_t *)(greg + pos);
+            pos += 2 + ver_len;
+            /* Campo 3: Nome da Instância (ex: "erp\0") */
+            uint16_t inst_len = *(const uint16_t *)(greg + pos);
+            const char *inst_str = (const char *)(greg + pos + 2);
+            pos += 2 + inst_len;
+            /* Campo 4: Caminho do sqllib da instância (ex: "/home/erp/sqllib\0") */
+            uint16_t path_len = *(const uint16_t *)(greg + pos);
+            const char *path_str = (const char *)(greg + pos + 2);
+
+            if (pos + 2 + path_len <= off + 4 + rec_len) {
+                char sys_dbdir[1024];
+                snprintf(sys_dbdir, sizeof(sys_dbdir), "%s/sqldbdir/sqldbdir", path_str);
+                FILE *dfp = fopen(sys_dbdir, "rb");
+                if (dfp) {
+                    uint8_t buf[4096];
+                    size_t n = fread(buf, 1, sizeof(buf), dfp);
+                    fclose(dfp);
+                    if (n >= 0x200 && memcmp(buf, "DB2 DIRECTORY", 13) == 0) {
+                        uint32_t num_entries = *(const uint32_t *)(buf + 0x14);
+                        uint32_t entry_off   = *(const uint32_t *)(buf + 0x34);
+                        for (uint32_t i = 0; i < num_entries && entry_off + 0x150 <= n; i++, entry_off += 0x518) {
+                            const char *alias = (const char *)(buf + entry_off + 0x00);
+                            const char *name  = (const char *)(buf + entry_off + 0x09);
+                            const char *path  = (const char *)(buf + entry_off + 0x26);
+                            if (db2_name_eq(alias, db_name) || db2_name_eq(name, db_name)) {
+                                snprintf(out_inst_name, inst_sz, "%s", inst_str);
+                                snprintf(sqllib_path, sizeof(sqllib_path), "%s", path_str);
+                                snprintf(db_root, sizeof(db_root), "%s", path);
+                                break;
+                            }
+                        }
+                    }
                 }
             }
+            if (db_root[0] != '\0') break;
         }
+        off += 4 + rec_len;
     }
 
-    char local_dbdir[512];
+    if (db_root[0] == '\0') return false;
+
+    /* 1.2 Lê o Local Database Directory (<db_root>/NODE0000/sqldbdir/sqldbdir) */
+    char local_dbdir[1024];
     snprintf(local_dbdir, sizeof(local_dbdir), "%s/NODE0000/sqldbdir/sqldbdir", db_root);
     char sql_subdir[64] = "";
 
-    fp = fopen(local_dbdir, "rb");
+    FILE *fp = fopen(local_dbdir, "rb");
     if (fp) {
         uint8_t buf[4096];
         size_t n = fread(buf, 1, sizeof(buf), fp);
@@ -518,9 +563,9 @@ static bool resolve_database_paths(const char *db_name, char *out_ctrl_dir, size
     if (sql_subdir[0] == '\0') return false;
     snprintf(out_ctrl_dir, ctrl_sz, "%s/NODE0000/%s", db_root, sql_subdir);
 
+    /* 1.3 Lê o Automatic Storage Path diretamente de SQLSGF.1 (offset 0x1114) */
     char sgf_path[1024];
     snprintf(sgf_path, sizeof(sgf_path), "%s/SQLSGF.1", out_ctrl_dir);
-    snprintf(out_storage_path, stor_sz, "/db2data_erp/data");
     fp = fopen(sgf_path, "rb");
     if (fp) {
         uint8_t sgf[0x1300];
@@ -530,7 +575,7 @@ static bool resolve_database_paths(const char *db_name, char *out_ctrl_dir, size
         }
         fclose(fp);
     }
-    return true;
+    return (out_storage_path[0] != '\0');
 }
 
 /* 2. Resolve o container físico de uma Tablespace ID lendo SQLSPCS.1 (Slot de 256 KB) */
