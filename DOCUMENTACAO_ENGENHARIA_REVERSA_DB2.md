@@ -20,6 +20,7 @@
 12. [Engenharia Reversa das Operações `INSERT`, `DELETE`, `UPDATE` e `RE-INSERT` (`libdb2e.so.1` + Transaction Log)](#12-engenharia-reversa-das-operações-insert-delete-update-e-re-insert-libdb2eso1--transaction-log)
 13. [Topologia Multi-Container e Algoritmo de Striping (Round-Robin de Extents)](#13-topologia-multi-container-e-algoritmo-de-striping-round-robin-de-extents)
 14. [Anatomia e Parametrização Universal de Páginas de 8KB, 16KB e 32KB](#14-anatomia-e-parametrização-universal-de-páginas-de-8kb-16kb-e-32kb)
+15. [Engenharia Reversa da Compressão de Linhas (Static & Adaptive Row Compression)](#15-engenharia-reversa-da-compressão-de-linhas-static--adaptive-row-compression)
 
 ---
 
@@ -680,3 +681,77 @@ Criamos e validamos tabelas reais em cada tamanho de página:
 * `ERP.TAB16K` em `TBS16K` (16KB) $\rightarrow$ 1 registro com string longa de 8KB lido diretamente.
 * `ERP.TAB32K` em `TBS32K` (32KB) $\rightarrow$ 1 registro gigante com string de 20KB e timestamp lido diretamente.
 * `ERP.TAB_STRIPE` em `TBS_MULTI` (Multi-Container Striping) $\rightarrow$ 250 registros distribuídos em 2 containers lidos com 100% de sucesso.
+
+---
+
+## 15. Engenharia Reversa da Compressão de Linhas (Static & Adaptive Row Compression)
+
+A compressão de tabelas no IBM Db2 (`COMPRESS YES STATIC` ou `COMPRESS YES ADAPTIVE`) baseia-se na substituição de padrões repetidos por tokens curtos de bits, apoiados por um dicionário de substituição construído offline (via `REORG TABLE ... RESETDICTIONARY`) ou online (*Automatic Dictionary Creation*).
+
+### 15.1 Detecção Físico-Binária da Linha Comprimida (`rflags & 0x0080`)
+No cabeçalho de 8 bytes de qualquer registro `FIXEDVAR`:
+* Linha padrão não-comprimida: `rflags = 0x0001` (bit 0 ligado).
+* **Linha comprimida com Dicionário:** **`rflags = 0x0081` (o bit `0x0080` indica compressão ativa)**.
+* Ao encontrar o bit `0x0080`, o payload do registro **não segue** a disposição posicional de colunas descrita na *Table Description* (Slot 3), mas sim uma sequência contínua de tokens codificados pelo dicionário.
+* **Ganho real comprovado:** Na tabela `ERP.TAB_COMP_STATIC` com 2.500 linhas, o tamanho médio foi reduzido de **~160 bytes para 29 bytes**, permitindo acomodar **136 registros comprimidos por página de 4KB** (contra apenas ~25 registros no modo tradicional).
+
+---
+
+### 15.2 Topologia de Armazenamento do Dicionário no Objeto da Tabela
+O Db2 armazena o dicionário de compressão global diretamente dentro do segmento de dados (`Type = 0x00`) da própria tabela, antes das linhas de dados:
+1. **Página 0, Slot 4 — `HEADREC` (`rec_flags = 0x0040`):**
+   * Contém os metadados do dicionário: identificadores da árvore de prefixos (`SP Dictionary Tree Node`), tamanho total e raízes de expansão.
+2. **Páginas 1 a 14, Slot 0 — `NEXTREC` (`rec_flags = 0x0040`):**
+   * Cada página possui **apenas 1 registro (`SlotCnt = 1`)** com `rec_len = 4005` bytes contendo os blocos de continuação do dicionário.
+3. **Página 15 — Término do Dicionário e Início dos Dados:**
+   * `Página 15, Slot 0`: Bloco final do dicionário (`rec_flags = 0x0040`, `len = 1680` bytes).
+   * `Página 15, Slot 1..75`: **Início das linhas comprimidas de usuários (`rec_flags = 0x0081`)**.
+   * `Páginas 16..33`: Páginas 100% preenchidas com linhas comprimidas (136 slots por página).
+
+---
+
+### 15.3 Disassembly do Algoritmo de Descompressão (`PCAndSPExpandRec` em `libdb2e.so.1`)
+O processo de descompressão é executado pela cadeia de funções:
+* `sqldExpandFullRec` (`0x02b6b330`)
+* `sqldExpandRec` (`0x02b6a9b0`)
+* `PCAndSPExpandRec` (`0x02d53ed0`)
+* `PCExpandRec` (`0x02d53b40`)
+
+#### Estrutura da Tabela do Dicionário de Expansão (`SPBINEXPDICT` — 32 KB)
+O dicionário é montado em memória num bloco de **32.768 bytes (`0x8000`)**, dividido em **2.048 entradas de 16 bytes**:
+* Cada entrada possui 16 bytes: `uint64_t w0` e `uint64_t w1`.
+* O **tamanho do símbolo descomprimido (`sym_len`)** está codificado no **byte mais significativo de `w0`**:
+  $$\mathtt{sym\_len} = w_0 \gg 56$$
+* Os bytes descomprimidos daquele símbolo ocupam `entry[0 .. sym_len-1]`.
+
+#### Decodificação dos Tokens de 12 bits no Stream Comprimido
+No disassembly de `PCAndSPExpandRec`:
+```asm
+   0x2d53f0c: movzbl (%rbx,%r8,1),%r14d       # Lê byte de controle
+   0x2d53f11: inc    %rbx
+   0x2d53f14: cmp    $0xf0,%r14
+   ...
+   0x2d54231: rol    $0x7,%r13w               # Token 1: rotaciona 7 bits para a esquerda
+   0x2d54236: rol    $0xb,%dx                 # Token 2: rotaciona 11 bits para a esquerda
+   0x2d54241: and    $0x7ff8,%r14d            # Máscara alinhada a 8 bytes dentro dos 32 KB
+   0x2d54248: and    $0x7ff8,%edx
+   0x2d5424e: mov    (%r14,%rsi,1),%r15       # R15 = w0 da entrada no dicionário
+   0x2d54252: mov    0x8(%r14,%rsi,1),%r14    # R14 = w1 da entrada no dicionário
+   0x2d54260: mov    %r15,(%rdi)              # Grava no buffer de destino
+   0x2d54273: shr    $0x38,%r15               # Extrai sym_len (w0 >> 56)
+   0x2d54277: add    %r15,%rdi                # Avança ponteiro de saída pelo sym_len
+   0x2d5428c: add    $0x3,%rbx                # Consumiu 3 bytes do stream (2 tokens de 12b = 24b)
+```
+
+1. **Tokens Empacotados em 24 bits (3 bytes $\rightarrow$ 2 tokens de 12 bits):**
+   * $\mathtt{offset1} = ((b_0 \mid (b_1 \ll 8)) \text{ rol } 7) \ \& \ \mathtt{0x7FF8}$
+   * $\mathtt{offset2} = ((b_1 \mid (b_2 \ll 8)) \text{ rol } 11) \ \& \ \mathtt{0x7FF8}$
+2. **Tokens Literais e Padrões Locais (`r14 < 0xF0`):**
+   * Copia repetições literais de bytes que não foram indexadas no dicionário global.
+3. **Padrões de Escape (`r14 == 0xFF`):**
+   * Indica sequência estendida com offsets de 2 bytes adicionais.
+
+---
+
+### 15.4 Integração no Leitor Standalone (`db2_select`)
+Identificamos a necessidade de proteger o leitor contra decodificação errônea de linhas comprimidas: ao encontrar `rflags & 0x0080`, o leitor reconhece que os bytes pertencem ao stream LZ/SP comprimido, evitando a leitura de lixo binário e preparando a base para a expansão direta via dicionário `HEADREC`/`NEXTREC`.

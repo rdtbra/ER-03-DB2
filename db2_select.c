@@ -430,9 +430,17 @@ static bool scan_table_object(const tablespace_ctx_t *ctx, uint16_t target_obj_i
                 uint16_t base_type = rec_type & 0x0007;
                 if ((base_type != 0x0000 && base_type != 0x0004) || (rec_flags & 0x0001) == 0) continue;
 
-                for (uint16_t c = 0; c < num_cols; c++) {
-                    int16_t scale = col_scales ? col_scales[c] : 0;
-                    format_column_value(rec, rec_len, &pcols[c], scale, col_vals[c], 256);
+                bool is_compressed = (rec_flags & 0x0080) != 0;
+                if (is_compressed) {
+                    snprintf(col_vals[0], 256, "[COMPRESSED]");
+                    for (uint16_t c = 1; c < num_cols; c++) {
+                        snprintf(col_vals[c], 256, "<LZ/SP Dict>");
+                    }
+                } else {
+                    for (uint16_t c = 0; c < num_cols; c++) {
+                        int16_t scale = col_scales ? col_scales[c] : 0;
+                        format_column_value(rec, rec_len, &pcols[c], scale, col_vals[c], 256);
+                    }
                 }
 
                 if (!cb(bps->obj_page_num, s, col_vals, num_cols, user_data)) {
