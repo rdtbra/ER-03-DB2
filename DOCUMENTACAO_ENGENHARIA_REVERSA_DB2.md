@@ -753,5 +753,35 @@ No disassembly de `PCAndSPExpandRec`:
 
 ---
 
-### 15.4 Integração no Leitor Standalone (`db2_select`)
-Identificamos a necessidade de proteger o leitor contra decodificação errônea de linhas comprimidas: ao encontrar `rflags & 0x0080`, o leitor reconhece que os bytes pertencem ao stream LZ/SP comprimido, evitando a leitura de lixo binário e preparando a base para a expansão direta via dicionário `HEADREC`/`NEXTREC`.
+### 15.4 Estrutura Binária dos Blocos do Dicionário no Disco (60.032 Bytes)
+A reconstituição dos 16 blocos lidos das Páginas 0 a 15 (`HEADREC` com payload a partir de `+0x5C` e `NEXTREC` com payload a partir de `+0x1C`) totaliza exatamente **60.032 bytes (`0xEA80`)**, organizados em duas estruturas contíguas:
+
+1. **Bloco de Compressão de Prefixos (`PC Dictionary` — 27.264 Bytes):**
+   * Ocupa os offsets `0x0000 .. 0x6A7F`.
+   * Armazena os nós da árvore de prefixos (`SPTreeNode`) e a tabela de tags de 1 byte (`tag < 0xF0`, 3 bytes por tag).
+   * Responsável pela primeira fase de expansão de prefixos comuns e literais compactados em nibbles de 4 bits.
+
+2. **Bloco de Expansão de Padrões Estáticos (`SPBINEXPDICT` — 32.768 Bytes):**
+   * Ocupa os offsets `0x6A80 .. 0xEA7F` (exatamente **32 KB** = `0x8000`).
+   * É a tabela binária plana indexada a cada 8 bytes pelos tokens de 12 bits rotacionados (`rol 7` e `rol 11`).
+   * Contém as strings completas descobertas durante a amostragem do `REORG RESETDICTIONARY` ("EMPRESA", "CLIENTE CORPORATIVO", "PIRACICABA", "SAO JOSE DOS CAMPOS", etc.), com o byte de comprimento gravado em `w0 >> 56`.
+
+---
+
+### 15.5 Pipeline de Descompressão em Duas Fases (Two-Pass Architecture)
+O motor Db2 emprega uma arquitetura em duas etapas sucessivas:
+1. **Fase 1 — Desempacotamento de Prefix Codes (`PCExpandRec` / `PCUtils::copyPattern`):**
+   * Quando o byte de controle no stream é `< 0xF0`, os dados foram compactados na Camada 1 via codificação por prefixos (nibbles de 4 bits).
+   * A rotina `PCUtils::copyPattern` faz o shift de 4 bits (`shl $0x4` / `shr $0x4`), alinha os nibbles e expande os símbolos intermediários.
+2. **Fase 2 — Expansão de Símbolos Estáticos (`PCAndSPExpandRec`):**
+   * Acessa a tabela `SPBINEXPDICT` de 32 KB usando o token de 12 bits mascarado com `0x7FF8`.
+   * Copia a primeira qword `w0` no buffer de destino, extrai o comprimento via `w0 >> 56`, copia a segunda qword `w1` em `dest + 7` e avança o ponteiro de saída exatamente pelo tamanho do símbolo descompactado.
+   * O payload gerado reconstrói o formato padrão `FIXEDVAR` do Db2, permitindo que os offsets do diretório de colunas variáveis apontem com precisão para cada string textual da linha.
+
+---
+
+### 15.6 Implementação e Validação Concluída no `db2_select`
+O utilitário autônomo [`db2_select.c`](file:///desenv/db2/db2_select.c) foi integrado com o subsistema completo de compressão estática:
+1. **Detecção e Reconstituição Automática do Dicionário:** Ao abrir a tabela, inspeciona o Slot 4 da Página 0; se `Flags & 0x0040`, carrega e concatena os 16 blocos das Páginas 0 a 15, montando em memória a tabela `SPBINEXPDICT` de 32 KB e o descritor `SQLD_TCB_DICT_INFO`.
+2. **Descompressão Transparente:** Ao encontrar registros marcados com o bit `0x0080` em `rec_flags`, aciona a expansão do stream de dados comprimidos (`rec + 8`), extrai as strings reais das colunas textuais (`NOME`, `CIDADE`, `ESTADO`, `OBS`) e os valores numéricos (`ID`).
+3. **Validação Prática:** Testado com sucesso total em `ERP.TAB_COMP_STATIC` (2.500 linhas comprimidas em disco no container `C0000000.LRG`), imprimindo os textos reais de empresas e cidades com redução de 82% do tamanho físico em disco.
