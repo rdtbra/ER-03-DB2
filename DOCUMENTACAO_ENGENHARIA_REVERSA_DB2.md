@@ -13,8 +13,13 @@
 5. [Anatomia Física dos Containers DMS / Automatic Storage](#5-anatomia-física-dos-containers-dms--automatic-storage)
 6. [Anatomia de Páginas de Dados (`Type = 0x00`) e Registros `FIXEDVAR`](#6-anatomia-de-páginas-de-dados-type--0x00-e-registros-fixedvar)
 7. [Anatomia do Objeto de Índice B+Tree (`Type = 0x01`)](#7-anatomia-do-objeto-de-índice-btree-type--0x01)
-8. [Ferramenta Desenvolvida em C (`db2_inspector.c`)](#8-ferramenta-desenvolvida-em-c-db2_inspectorc)
-9. [Próxima Etapa: Transaction Logs (`LOGSTREAM0000` e `SQLOGCTL.LFH`)](#9-próxima-etapa-transaction-logs-logstream0000-e-sqlogctllfh)
+8. [Engenharia Reversa de Transaction Logs (`SQLOGCTL.LFH` e `S000000X.LOG`)](#8-engenharia-reversa-de-transaction-logs-sqlogctllfh-e-s000000xlog)
+9. [Ferramenta Completa Desenvolvida em C (`db2_inspector.c`)](#9-ferramenta-completa-desenvolvida-em-c-db2_inspectorc)
+10. [Leitor Direto de Tabelas por Nome (`db2_select.c` — `<BANCO> <SCHEMA> <TABELA>`)](#10-leitor-direto-de-tabelas-por-nome-db2_selectc--banco-schema-tabela)
+11. [Engenharia Reversa do Checksum de Página (`sqlbCalculatePageCheckSum`) e Patch Cirúrgico no Catálogo (`db2_rename_idx.c`)](#11-engenharia-reversa-do-checksum-de-página-sqlbcalculatepagechecksum-e-patch-cirúrgico-no-catálogo-db2_rename_idxc)
+12. [Engenharia Reversa das Operações `INSERT`, `DELETE`, `UPDATE` e `RE-INSERT` (`libdb2e.so.1` + Transaction Log)](#12-engenharia-reversa-das-operações-insert-delete-update-e-re-insert-libdb2eso1--transaction-log)
+13. [Topologia Multi-Container e Algoritmo de Striping (Round-Robin de Extents)](#13-topologia-multi-container-e-algoritmo-de-striping-round-robin-de-extents)
+14. [Anatomia e Parametrização Universal de Páginas de 8KB, 16KB e 32KB](#14-anatomia-e-parametrização-universal-de-páginas-de-8kb-16kb-e-32kb)
 
 ---
 
@@ -552,3 +557,126 @@ Durante a investigação também desmontamos as 3 funções de log de `UPDATE` c
 * **`sqldWriteXOROnlyLR` (`0x02a73120` — `comp_id = 0x01, func_id = 0x72`):** Calcula um `XOR` bit a bit (`old_bytes ^ new_bytes`) da fatia alterada da linha (`xor (%r11,%rdi,8), %rax` em `0x2a73459`), pois o mesmo vetor XOR serve tanto para **Redo** (`old ^ xor = new`) quanto para **Undo** (`new ^ xor = old`)!
 * **`sqldWriteXORFullOffsetLR` (`0x02a75420` — `comp_id = 0x01, func_id = 0xB7`):** Variante XOR com offset completo.
 * **`sqldWriteFullBeforeDeltaUpdLR` (`0x02a74640` — `comp_id = 0x01, func_id = 0xBE`):** Grava a Before-Image completa de `rec_len - 4` bytes (para Undo) seguida apenas da fatia Delta modificada (`DeltaOff` em `+0x42`, `DeltaLen` em `+0x44`) para Redo (exatamente como capturado no `Rec #33`, `LSN=0x7D453` em `S0000000.LOG`).
+
+---
+
+## 13. Topologia Multi-Container e Algoritmo de Striping (Round-Robin de Extents)
+
+Quando uma *tablespace* DMS ou Automatic Storage possui múltiplos arquivos de container (por exemplo, ao adicionar múltiplos *storage paths* a um *Storage Group* com `CREATE STOGROUP MULTISG ON '/path1', '/path2'`), o Db2 divide a capacidade em **Stripe Sets** e distribui os extents físicos em regime de **Round-Robin** estrito entre os containers do conjunto.
+
+### 13.1 Mapeamento Estrutural em `SQLSPCS.1` / `SQLSPCS.2`
+No cabeçalho do slot de 256 KB de cada tablespace em `SQLSPCS.1`:
+* **`+0x0448` (`uint32_t num_containers`):** Quantidade total de containers configurados na tablespace.
+* **`+0x0450` (`uint32_t total_cont_bytes`):** Tamanho total somado da área de descritores de container em `+0xC000`.
+* **Sequência de Containers a partir de `+0xC000`:**
+  Os containers são gravados consecutivamente sem padding fixo entre eles. Cada descritor possui:
+  * `+0x00`: `uint32_t cont_type` (`6` = File DMS)
+  * `+0x04`: `uint32_t total_pages` (ex: `4096`)
+  * `+0x08`: `uint32_t useable_pages` (ex: `4064 = total_pages - extent_size`)
+  * `+0x30`: `int32_t path_id` (ex: `1024`, `1025`)
+  * `+0x34`: String ASCII com o caminho do container (`c_path`) terminada em `\0`.
+  * **Offset do Próximo Container:**
+    $$\mathtt{NextContainerOffset} = \mathtt{CurrentOffset} + \mathtt{0x34} + \text{strlen}(c\_path) + 1$$
+
+---
+
+### 13.2 Disassembly das Rotinas Internas de Striping (`libdb2e.so.1`)
+A tradução de uma página lógica da tablespace (`Pool Page`) para seu container físico e número de página dentro do arquivo (`File Page`) é executada por:
+* `sqlbMapPoolPG2Container` (`0x025f6bf0`)
+* `sqlbDMSMapPool2Container` (`0x028ab0f0`)
+* `sqlb_locate_extent_in_current_map` (`0x02831870`)
+
+No disassembly de `sqlb_locate_extent_in_current_map`:
+```asm
+   0x28ab257: idiv   %r13                  # pool_page / extent_size (quociente em %eax, resto em %edx)
+   ...
+   0x2831986: divl   0x2c(%rbp)            # extent_in_range / num_containers (0x2c)
+   0x283198c: mov    0x30(%rbp,%rdx,4),%ebp# container_id = range->containers[resto]
+   0x28319c5: mov    %eax,(%r14)           # extent_in_container = quociente
+   ...
+   0x28ab288: imul   %r13,%rbx             # extent_in_container * extent_size
+   0x28ab293: add    %rbx,%r8              # + page_in_extent
+   0x28ab2a4: add    %rsi,%r8              # + tag_pages
+```
+
+### 13.3 Fórmulas Matemáticas Universais de Striping
+Dado `pool_page`, `extent_size`, `num_containers` e `tag_pages`:
+$$\mathtt{pool\_extent} = \mathtt{pool\_page} \mathbin{/} \mathtt{extent\_size}$$
+$$\mathtt{page\_in\_extent} = \mathtt{pool\_page} \pmod{\mathtt{extent\_size}}$$
+$$\mathtt{container\_idx} = \mathtt{pool\_extent} \pmod{\mathtt{num\_containers}}$$
+$$\mathtt{extent\_in\_container} = \mathtt{pool\_extent} \mathbin{/} \mathtt{num\_containers}$$
+$$\mathtt{file\_page} = \mathtt{tag\_pages} + (\mathtt{extent\_in\_container} \times \mathtt{extent\_size}) + \mathtt{page\_in\_extent}$$
+
+**Fórmula Inversa (Dada uma `File Page` em um container `c`):**
+$$\mathtt{extent\_in\_container} = (\mathtt{file\_page} - \mathtt{tag\_pages}) \mathbin{/} \mathtt{extent\_size}$$
+$$\mathtt{page\_in\_extent} = (\mathtt{file\_page} - \mathtt{tag\_pages}) \pmod{\mathtt{extent\_size}}$$
+$$\mathtt{pool\_extent} = (\mathtt{extent\_in\_container} \times \mathtt{num\_containers}) + c$$
+$$\mathtt{pool\_page} = (\mathtt{pool\_extent} \times \mathtt{extent\_size}) + \mathtt{page\_in\_extent}$$
+
+### 13.4 Validação Empírica no Banco `ERP` (`TBS_MULTI` / `ERP.TAB_STRIPE`)
+Criamos uma tablespace `TBS_MULTI` (`ExtentSize = 32`) com 2 containers:
+* Container 0: `/db2data_erp/stogroup1/.../T0000007/C0000000.LRG`
+* Container 1: `/db2data_erp/stogroup2/.../T0000007/C0000001.LRG`
+
+Varredura dos Extents Físicos e BPS Headers:
+| Pool Extent | Pool Page | Objeto / Função | Tipo Físico | Container Alvo | File Extent | File Page |
+| :---: | :---: | :--- | :---: | :---: | :---: | :---: |
+| **0** | `0` | `0xFFFE` (SMP Principal) | `0x0E` | **Container 0** | Extent 1 | 32 |
+| **1** | `32` | `0xFFFE` (SMP Extent 1) | `0x0E` | **Container 1** | Extent 1 | 32 |
+| **2** | `64` | `0xFFFF` (Object Table) | `0x00` | **Container 0** | Extent 2 | 64 |
+| **3** | `96` | `0x0004` (Table EMP Dados) | `0x40` | **Container 1** | Extent 2 | 64 |
+| **4** | `128` | `0x0004` (Dados: Páginas 0..31) | `0x00` | **Container 0** | Extent 3 | 96 |
+| **5** | `160` | `0x0004` (Table EMP Índice) | `0x41` | **Container 1** | Extent 3 | 96 |
+| **6** | `192` | `0x0004` (Índice B+Tree) | `0x01` | **Container 0** | Extent 4 | 128 |
+| **7** | `224` | `0x0004` (Dados: Páginas 32..63)| `0x00` | **Container 1** | Extent 4 | 128 |
+
+O leitor standalone [`db2_select.c`](file:///desenv/db2/db2_select.c) foi atualizado com essa máquina de mapeamento e leu com perfeição todos os **250 registros** da tabela `ERP.TAB_STRIPE`, intercalando as leituras entre ambos os containers transparentemente!
+
+---
+
+## 14. Anatomia e Parametrização Universal de Páginas de 8KB, 16KB e 32KB
+
+Validamos o comportamento interno do Db2 ao utilizar *Bufferpools* e *Tablespaces* configuradas com tamanhos de página não-padrão de **8.192 bytes (8KB)**, **16.384 bytes (16KB)** e **32.768 bytes (32KB)**.
+
+### 14.1 BPS Header Universal (48 bytes em todas as páginas)
+Independentemente do *PageSize*, o cabeçalho BPS mantém tamanho fixo de 48 bytes (`0x30`):
+* `+0x00` (`uint16_t page_data_offset`): Permanece fixo em **`48 (0x0030)`**.
+* `+0x02` (`uint16_t page_data_length`): Informa exatamente **`PageSize - 48`**:
+  * 4KB: `4048 (0x0FD0)`
+  * 8KB: `8144 (0x1FD0)`
+  * 16KB: `16336 (0x3FD0)`
+  * 32KB: `32720 (0x7FD0)`
+
+> **Detecção Automática:** Ao inspecionar qualquer arquivo binário de container, o tamanho real da página pode ser obtido instantaneamente lendo os primeiros 4 bytes da Pool Page 0:
+> $$\mathtt{PageSize} = \mathtt{page\_data\_length} + 48$$
+
+---
+
+### 14.2 Data Page Header (20 bytes) e Slot Directory
+* O cabeçalho da página de dados mantém os mesmos 20 bytes (`0x30..0x43`).
+* O **Slot Directory** inicia sempre no byte fixo **`0x44` (68 bytes)** a partir do início da página.
+* Cada slot armazena um `uint16_t` com o offset relativo a `0x44`:
+  $$\mathtt{OffsetNaPagina} = \mathtt{0x44} + \mathtt{slot\_offset}$$
+
+---
+
+### 14.3 Disposição dos Metadados na Página 0
+* **Slot 0 (Control Header de 32 bytes):** Fica sempre alinhado encostado no final da página:
+  $$\mathtt{OffsetSlot0} = \mathtt{PageSize} - 32$$
+  * Em 4KB: `0x0FE0` (4064)
+  * Em 8KB: `0x1FE0` (8160)
+  * Em 16KB: `0x3FE0` (16352)
+  * Em 32KB: `0x7FE0` (32736)
+* **Slot 1 (FSCR — Free Space Control Record):** Permanece fixo com **1.004 bytes** (500 entradas de `uint16_t` controlando o espaço das 500 páginas lógicas seguintes).
+* **Slot 2 (TDIR):** Permanece com **76 bytes**.
+* **Slot 3 (Table Description):** Contém os mesmos descritores de coluna de 8 bytes cada.
+* **Slot 4+ (Registros FIXEDVAR):** Alocados dinamicamente no espaço livre ampliado da página (permitindo linhas de até ~32 KB sem necessidade imediata de ponteiro de *overflow*).
+
+---
+
+### 14.4 Testes e Validação Completa
+Criamos e validamos tabelas reais em cada tamanho de página:
+* `ERP.TAB8K` em `TBS8K` (8KB) $\rightarrow$ 2 registros lidos diretamente via [`db2_select`](file:///desenv/db2/db2_select).
+* `ERP.TAB16K` em `TBS16K` (16KB) $\rightarrow$ 1 registro com string longa de 8KB lido diretamente.
+* `ERP.TAB32K` em `TBS32K` (32KB) $\rightarrow$ 1 registro gigante com string de 20KB e timestamp lido diretamente.
+* `ERP.TAB_STRIPE` em `TBS_MULTI` (Multi-Container Striping) $\rightarrow$ 250 registros distribuídos em 2 containers lidos com 100% de sucesso.

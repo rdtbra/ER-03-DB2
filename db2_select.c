@@ -104,10 +104,19 @@ typedef struct {
 typedef struct {
     FILE    *fp;
     char     path[512];
-    uint32_t extent_size;
-    uint32_t tag_pages;
     uint32_t total_file_pages;
-} container_ctx_t;
+    uint32_t useable_pages;
+} container_t;
+
+typedef struct {
+    char        name[129];
+    uint16_t    tbsp_id;
+    uint32_t    page_size;
+    uint32_t    extent_size;
+    uint32_t    tag_pages;
+    uint32_t    num_containers;
+    container_t containers[16];
+} tablespace_ctx_t;
 
 /* Remove espaços à direita de uma string */
 static void rtrim(char *s) {
@@ -127,61 +136,38 @@ static bool db2_name_eq(const char *a, const char *b) {
     return strcasecmp(ca, cb) == 0;
 }
 
-/* Lê uma página do arquivo (File Page) */
-static bool read_file_page(FILE *fp, uint32_t file_page, void *buf) {
-    if (fseek(fp, (long)file_page * DB2_PAGE_SIZE, SEEK_SET) != 0) return false;
-    return fread(buf, 1, DB2_PAGE_SIZE, fp) == DB2_PAGE_SIZE;
+/* Lê uma página física de um container */
+static bool read_file_page(FILE *fp, uint32_t file_page, uint32_t page_size, void *buf) {
+    if (fseek(fp, (long)file_page * page_size, SEEK_SET) != 0) return false;
+    return fread(buf, 1, page_size, fp) == page_size;
 }
 
-/* Lê uma página lógica da tablespace (Pool Page) */
-static bool read_pool_page(const container_ctx_t *ctx, uint32_t pool_page, void *buf) {
-    return read_file_page(ctx->fp, pool_page + ctx->tag_pages, buf);
+/* Lê uma página lógica da tablespace (Pool Page) com Striping Multi-Container */
+static bool read_pool_page(const tablespace_ctx_t *ctx, uint32_t pool_page, void *buf) {
+    if (ctx->num_containers == 0) return false;
+    uint32_t pool_extent = pool_page / ctx->extent_size;
+    uint32_t page_in_extent = pool_page % ctx->extent_size;
+    uint32_t c_idx = pool_extent % ctx->num_containers;
+    uint32_t extent_in_c = pool_extent / ctx->num_containers;
+    uint32_t file_page = ctx->tag_pages + (extent_in_c * ctx->extent_size) + page_in_extent;
+
+    if (c_idx >= ctx->num_containers || !ctx->containers[c_idx].fp) return false;
+    return read_file_page(ctx->containers[c_idx].fp, file_page, ctx->page_size, buf);
 }
 
-/* Abre um container DMS / Automatic Storage e auto-detecta geometria (DB2CONT + Meta-SMP) */
-static bool open_container(const char *path, container_ctx_t *ctx) {
-    memset(ctx, 0, sizeof(*ctx));
-    snprintf(ctx->path, sizeof(ctx->path), "%s", path);
-    ctx->fp = fopen(path, "rb");
-    if (!ctx->fp) return false;
-
-    fseek(ctx->fp, 0, SEEK_END);
-    long fsize = ftell(ctx->fp);
-    ctx->total_file_pages = (uint32_t)(fsize / DB2_PAGE_SIZE);
-
-    uint8_t page[DB2_PAGE_SIZE];
-    ctx->extent_size = 32;
-    ctx->tag_pages   = 32;
-
-    for (uint32_t p = 1; p <= 256 && p < ctx->total_file_pages; p++) {
-        if (!read_file_page(ctx->fp, p, page)) break;
-        const db2_bps_header_t *bps = (const db2_bps_header_t *)page;
-        if (bps->page_data_offset == BPS_HEADER_SIZE &&
-            bps->page_data_length == (DB2_PAGE_SIZE - BPS_HEADER_SIZE) &&
-            bps->pool_page_num == 0 &&
-            bps->object_id == 0xFFFE &&
-            bps->obj_type == 0x0E) {
-            ctx->tag_pages   = p;
-            ctx->extent_size = *(const uint32_t *)(page + 0x34);
-            if (ctx->extent_size == 0) ctx->extent_size = p;
-            break;
+static void close_tablespace(tablespace_ctx_t *ctx) {
+    for (uint32_t c = 0; c < ctx->num_containers && c < 16; c++) {
+        if (ctx->containers[c].fp) {
+            fclose(ctx->containers[c].fp);
+            ctx->containers[c].fp = NULL;
         }
-    }
-    return true;
-}
-
-static void close_container(container_ctx_t *ctx) {
-    if (ctx->fp) {
-        fclose(ctx->fp);
-        ctx->fp = NULL;
     }
 }
 
 /* Lê o array de extents a partir de uma página EMP (Type 0x40) */
-static uint32_t read_emp_extents(const container_ctx_t *ctx, uint32_t emp_pool_page,
+static uint32_t read_emp_extents(const tablespace_ctx_t *ctx, uint32_t emp_pool_page,
                                  uint32_t *extents_out, uint32_t max_extents) {
-    if (emp_pool_page == 0 || emp_pool_page >= (ctx->total_file_pages - ctx->tag_pages)) return 0;
-    uint8_t page[DB2_PAGE_SIZE];
+    uint8_t page[65536];
     if (!read_pool_page(ctx, emp_pool_page, page)) return 0;
 
     const db2_bps_header_t *bps = (const db2_bps_header_t *)page;
@@ -189,7 +175,7 @@ static uint32_t read_emp_extents(const container_ctx_t *ctx, uint32_t emp_pool_p
 
     const uint32_t *entries = (const uint32_t *)(page + 0x58);
     uint32_t count = 0;
-    uint32_t max_in_page = (DB2_PAGE_SIZE - 0x58) / sizeof(uint32_t);
+    uint32_t max_in_page = (ctx->page_size - 0x58) / sizeof(uint32_t);
     for (uint32_t i = 0; i < max_in_page && count < max_extents; i++) {
         if (entries[i] == 0xFFFFFFFF || entries[i] == 0x00000000) break;
         extents_out[count++] = entries[i];
@@ -198,12 +184,12 @@ static uint32_t read_emp_extents(const container_ctx_t *ctx, uint32_t emp_pool_p
 }
 
 /* Localiza a página EMP de Dados (Type=0x40) de um Object ID varrendo a Object Table (0xFFFF) */
-static bool find_object_data_emp(const container_ctx_t *ctx, uint16_t target_obj_id, uint32_t *out_data_emp) {
+static bool find_object_data_emp(const tablespace_ctx_t *ctx, uint16_t target_obj_id, uint32_t *out_data_emp) {
     uint32_t ot_extents[64];
     uint32_t num_ot_ext = read_emp_extents(ctx, 1, ot_extents, 64);
     if (num_ot_ext == 0) return false;
 
-    uint8_t pg0[DB2_PAGE_SIZE];
+    uint8_t pg0[65536];
     if (!read_pool_page(ctx, ot_extents[0], pg0)) return false;
     uint16_t slot0_off = *(const uint16_t *)(pg0 + SLOT_DIR_OFFSET + 0 * 2);
     uint32_t ot_page_count = *(const uint32_t *)(pg0 + SLOT_DIR_OFFSET + slot0_off + 4);
@@ -211,7 +197,7 @@ static bool find_object_data_emp(const container_ctx_t *ctx, uint16_t target_obj
     uint32_t pages_seen = 0;
     for (uint32_t e = 0; e < num_ot_ext && pages_seen < ot_page_count; e++) {
         for (uint32_t p = 0; p < ctx->extent_size && pages_seen < ot_page_count; p++) {
-            uint8_t page[DB2_PAGE_SIZE];
+            uint8_t page[65536];
             if (!read_pool_page(ctx, ot_extents[e] + p, page)) break;
 
             const db2_bps_header_t *bps = (const db2_bps_header_t *)page;
@@ -223,7 +209,7 @@ static bool find_object_data_emp(const container_ctx_t *ctx, uint16_t target_obj
 
             for (uint16_t s = start_slot; s < dhdr->slot_count; s++) {
                 uint16_t soff = *(const uint16_t *)(page + SLOT_DIR_OFFSET + s * 2);
-                if (soff == 0xFFFF || soff == 0x0000 || (SLOT_DIR_OFFSET + soff >= DB2_PAGE_SIZE)) continue;
+                if (soff == 0xFFFF || soff == 0x0000 || ((uint32_t)(SLOT_DIR_OFFSET + soff) >= ctx->page_size)) continue;
                 const uint8_t *rec = page + SLOT_DIR_OFFSET + soff;
                 uint16_t rec_type = *(const uint16_t *)(rec + 0);
                 uint16_t rec_len  = *(const uint16_t *)(rec + 2);
@@ -369,9 +355,9 @@ static void format_column_value(const uint8_t *rec, uint16_t rec_len,
 }
 
 /* Lê o Schema físico da Página 0 (Slot 0 = PageCount, Slot 3 = Descritores de Coluna) */
-static bool read_object_page0_schema(const container_ctx_t *ctx, uint32_t page0_pool,
+static bool read_object_page0_schema(const tablespace_ctx_t *ctx, uint32_t page0_pool,
                                      uint32_t *out_total_pages, db2_col_desc_t *cols, uint16_t *out_num_cols) {
-    uint8_t pg0[DB2_PAGE_SIZE];
+    uint8_t pg0[65536];
     if (!read_pool_page(ctx, page0_pool, pg0)) return false;
 
     const db2_data_page_hdr_t *dhdr0 = (const db2_data_page_hdr_t *)(pg0 + BPS_HEADER_SIZE);
@@ -394,7 +380,7 @@ typedef bool (*row_callback_fn)(uint32_t obj_pg, uint16_t slot,
                                 char col_vals[][256], uint16_t num_cols, void *user_data);
 
 /* Varre todas as páginas e slots de um Object ID em um container e invoca cb() para cada registro */
-static bool scan_table_object(const container_ctx_t *ctx, uint16_t target_obj_id,
+static bool scan_table_object(const tablespace_ctx_t *ctx, uint16_t target_obj_id,
                               const int16_t *col_scales, row_callback_fn cb, void *user_data,
                               uint32_t *out_total_pages, uint16_t *out_num_cols) {
     uint32_t data_emp = 0;
@@ -412,7 +398,7 @@ static bool scan_table_object(const container_ctx_t *ctx, uint16_t target_obj_id
     if (out_total_pages) *out_total_pages = obj_total_pages;
     if (out_num_cols)    *out_num_cols    = num_cols;
 
-    uint8_t page[DB2_PAGE_SIZE];
+    uint8_t page[65536];
     char (*col_vals)[256] = calloc(MAX_COLS, 256);
     if (!col_vals) return false;
 
@@ -434,7 +420,7 @@ static bool scan_table_object(const container_ctx_t *ctx, uint16_t target_obj_id
 
             for (uint16_t s = start_slot; s < dhdr->slot_count; s++) {
                 uint16_t soff = sdir[s];
-                if (soff == 0xFFFF || soff == 0x0000 || (SLOT_DIR_OFFSET + soff >= DB2_PAGE_SIZE)) continue;
+                if (soff == 0xFFFF || soff == 0x0000 || ((uint32_t)(SLOT_DIR_OFFSET + soff) >= ctx->page_size)) continue;
 
                 const uint8_t *rec = page + SLOT_DIR_OFFSET + soff;
                 uint16_t rec_type  = *(const uint16_t *)(rec + 0);
@@ -578,56 +564,70 @@ static bool resolve_database_paths(const char *db_name, char *out_ctrl_dir, size
     return (out_storage_path[0] != '\0');
 }
 
-/* 2. Resolve o container físico de uma Tablespace ID lendo SQLSPCS.1 (Slot de 256 KB) */
-static bool resolve_tablespace_container(const char *ctrl_dir, const char *storage_path,
-                                         const char *inst_name, const char *db_name,
-                                         uint16_t tbsp_id, char *out_tbsp_name, size_t name_sz,
-                                         char *out_cont_path, size_t path_sz) {
+/* 2. Resolve o contexto físico completo de uma Tablespace ID lendo SQLSPCS.1 (Slot de 256 KB) */
+static bool resolve_tablespace_context(const char *ctrl_dir, const char *storage_path,
+                                       const char *inst_name, const char *db_name,
+                                       uint16_t tbsp_id, tablespace_ctx_t *ctx) {
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->tbsp_id = tbsp_id;
+
     char spcs_file[1024];
     snprintf(spcs_file, sizeof(spcs_file), "%s/SQLSPCS.1", ctrl_dir);
     FILE *fp = fopen(spcs_file, "rb");
     if (!fp) return false;
 
     const long SLOT_SIZE = 0x40000;
-    if (fseek(fp, (long)tbsp_id * SLOT_SIZE, SEEK_SET) != 0) {
-        fclose(fp);
-        return false;
-    }
-
-    uint8_t hdr[0x100];
-    if (fread(hdr, 1, sizeof(hdr), fp) != sizeof(hdr)) {
-        fclose(fp);
-        return false;
-    }
-
-    int16_t slot_tbsp_id = *(const int16_t *)(hdr + 0x08);
-    if (slot_tbsp_id != (int16_t)tbsp_id) {
-        fclose(fp);
-        return false;
-    }
-
-    snprintf(out_tbsp_name, name_sz, "%s", (const char *)(hdr + 0x0A));
-    rtrim(out_tbsp_name);
-
-    uint8_t cont_area[0x200];
-    if (fseek(fp, (long)tbsp_id * SLOT_SIZE + 0xC000, SEEK_SET) != 0 ||
-        fread(cont_area, 1, sizeof(cont_area), fp) != sizeof(cont_area)) {
+    uint8_t slot_buf[0x40000];
+    if (fseek(fp, (long)tbsp_id * SLOT_SIZE, SEEK_SET) != 0 ||
+        fread(slot_buf, 1, sizeof(slot_buf), fp) != sizeof(slot_buf)) {
         fclose(fp);
         return false;
     }
     fclose(fp);
 
-    const char *raw_cont = (const char *)(cont_area + 0x34);
-    if (raw_cont[0] == '/') {
-        snprintf(out_cont_path, path_sz, "%s", raw_cont);
-    } else {
-        char db_upper[64];
-        snprintf(db_upper, sizeof(db_upper), "%s", db_name);
-        for (int i = 0; db_upper[i]; i++) db_upper[i] = (char)toupper((unsigned char)db_upper[i]);
-        snprintf(out_cont_path, path_sz, "%s/%s/NODE0000/%s/T%07u/%s",
-                 storage_path, inst_name, db_upper, tbsp_id, raw_cont);
+    int16_t slot_tbsp_id = *(const int16_t *)(slot_buf + 0x08);
+    if (slot_tbsp_id != (int16_t)tbsp_id) return false;
+
+    snprintf(ctx->name, sizeof(ctx->name), "%s", (const char *)(slot_buf + 0x0A));
+    rtrim(ctx->name);
+
+    ctx->extent_size    = *(const uint32_t *)(slot_buf + 0x0098);
+    ctx->page_size      = *(const uint32_t *)(slot_buf + 0x045C);
+    ctx->num_containers = *(const uint32_t *)(slot_buf + 0x0448);
+
+    if (ctx->extent_size == 0) ctx->extent_size = 32;
+    if (ctx->page_size == 0) ctx->page_size = 4096;
+    if (ctx->num_containers == 0) ctx->num_containers = 1;
+
+    ctx->tag_pages = ctx->extent_size;
+
+    const uint8_t *curr_c = slot_buf + 0xC000;
+    for (uint32_t c = 0; c < ctx->num_containers && c < 16; c++) {
+        if ((curr_c - slot_buf) + 0x34 >= SLOT_SIZE) break;
+        uint32_t c_use = *(const uint32_t *)(curr_c + 0x08);
+        const char *raw_path = (const char *)(curr_c + 0x34);
+
+        container_t *cont = &ctx->containers[c];
+        if (raw_path[0] == '/') {
+            snprintf(cont->path, sizeof(cont->path), "%s", raw_path);
+        } else {
+            char db_upper[64];
+            snprintf(db_upper, sizeof(db_upper), "%s", db_name);
+            for (int i = 0; db_upper[i]; i++) db_upper[i] = (char)toupper((unsigned char)db_upper[i]);
+            snprintf(cont->path, sizeof(cont->path), "%s/%s/NODE0000/%s/T%07u/%s",
+                     storage_path, inst_name, db_upper, tbsp_id, raw_path);
+        }
+
+        cont->fp = fopen(cont->path, "rb");
+        if (cont->fp) {
+            fseek(cont->fp, 0, SEEK_END);
+            cont->total_file_pages = (uint32_t)(ftell(cont->fp) / ctx->page_size);
+            cont->useable_pages    = c_use;
+        }
+        curr_c += 0x34 + strlen(raw_path) + 1;
     }
-    return true;
+
+    return (ctx->containers[0].fp != NULL);
 }
 
 /* Callback para buscar uma tabela específica (ou listar todas) em SYSIBM.SYSTABLES (ObjID=5) */
@@ -788,17 +788,9 @@ int main(int argc, char **argv) {
     }
 
     /* 2. Localiza o container da SYSCATSPACE (Tablespace ID = 0) via SQLSPCS.1 */
-    char syscat_tbsp[129], syscat_cont_path[512];
-    if (!resolve_tablespace_container(ctrl_dir, storage_path, inst_name, db_name,
-                                      0, syscat_tbsp, sizeof(syscat_tbsp),
-                                      syscat_cont_path, sizeof(syscat_cont_path))) {
+    tablespace_ctx_t cat_ctx;
+    if (!resolve_tablespace_context(ctrl_dir, storage_path, inst_name, db_name, 0, &cat_ctx)) {
         fprintf(stderr, "Erro: Não foi possível localizar a SYSCATSPACE em '%s/SQLSPCS.1'.\n", ctrl_dir);
-        return 1;
-    }
-
-    container_ctx_t cat_ctx;
-    if (!open_container(syscat_cont_path, &cat_ctx)) {
-        fprintf(stderr, "Erro ao abrir o container do catálogo '%s': %s\n", syscat_cont_path, strerror(errno));
         return 1;
     }
 
@@ -806,7 +798,7 @@ int main(int argc, char **argv) {
     if (!table_name) {
         printf("====================================================================================================\n");
         printf(" TABELAS DO BANCO '%s' (Lidas diretamente de SYSIBM.SYSTABLES [ObjID=5] em %s)\n",
-               db_name, syscat_cont_path);
+               db_name, cat_ctx.containers[0].path);
         printf("====================================================================================================\n");
         printf("  %-14s | %-28s | %6s | %6s | %7s | %10s | %8s\n",
                "SCHEMA", "TABELA", "TBSPID", "OBJID", "COLUNAS", "CARD(ROWS)", "NPAGES");
@@ -821,7 +813,7 @@ int main(int argc, char **argv) {
         scan_table_object(&cat_ctx, 5, NULL, systables_cb, &st, NULL, NULL);
         printf("====================================================================================================\n");
         printf(" Total de tabelas encontradas: %u\n\n", st.listed_count);
-        close_container(&cat_ctx);
+        close_tablespace(&cat_ctx);
         return 0;
     }
 
@@ -837,14 +829,14 @@ int main(int argc, char **argv) {
     if (!st_search.result.found) {
         fprintf(stderr, "Erro: Tabela '%s.%s' não encontrada em SYSIBM.SYSTABLES do banco '%s'.\n",
                 schema_name, table_name, db_name);
-        close_container(&cat_ctx);
+        close_tablespace(&cat_ctx);
         return 1;
     }
 
     if (st_search.result.type != 'T') {
         fprintf(stderr, "Erro: O objeto '%s.%s' possui tipo '%c' (não é uma tabela física 'T').\n",
                 schema_name, table_name, st_search.result.type);
-        close_container(&cat_ctx);
+        close_tablespace(&cat_ctx);
         return 1;
     }
 
@@ -854,30 +846,22 @@ int main(int argc, char **argv) {
     sc_search.target_schema = schema_name;
     sc_search.target_table  = table_name;
     scan_table_object(&cat_ctx, 6, NULL, syscolumns_cb, &sc_search, NULL, NULL);
-    close_container(&cat_ctx);
+    close_tablespace(&cat_ctx);
 
-    /* 5. Resolve o container físico onde a tabela reside via SQLSPCS.1 */
-    char target_tbsp_name[129], target_cont_path[512];
-    if (!resolve_tablespace_container(ctrl_dir, storage_path, inst_name, db_name,
-                                      (uint16_t)st_search.result.tbsp_id,
-                                      target_tbsp_name, sizeof(target_tbsp_name),
-                                      target_cont_path, sizeof(target_cont_path))) {
-        fprintf(stderr, "Erro: Não foi possível resolver o container da Tablespace ID %d.\n",
+    /* 5. Resolve a tablespace e containers físicos onde a tabela reside via SQLSPCS.1 */
+    tablespace_ctx_t tbl_ctx;
+    if (!resolve_tablespace_context(ctrl_dir, storage_path, inst_name, db_name,
+                                    (uint16_t)st_search.result.tbsp_id, &tbl_ctx)) {
+        fprintf(stderr, "Erro: Não foi possível resolver a Tablespace ID %d.\n",
                 st_search.result.tbsp_id);
-        return 1;
-    }
-
-    container_ctx_t tbl_ctx;
-    if (!open_container(target_cont_path, &tbl_ctx)) {
-        fprintf(stderr, "Erro ao abrir o container '%s': %s\n", target_cont_path, strerror(errno));
         return 1;
     }
 
     uint32_t data_emp = 0;
     if (!find_object_data_emp(&tbl_ctx, (uint16_t)st_search.result.obj_id, &data_emp)) {
-        fprintf(stderr, "Erro: Objeto ID %d não encontrado na Object Table do container '%s'.\n",
-                st_search.result.obj_id, target_cont_path);
-        close_container(&tbl_ctx);
+        fprintf(stderr, "Erro: Objeto ID %d não encontrado na Object Table da tablespace '%s'.\n",
+                st_search.result.obj_id, tbl_ctx.name);
+        close_tablespace(&tbl_ctx);
         return 1;
     }
 
@@ -921,10 +905,13 @@ int main(int argc, char **argv) {
            st_search.result.schema, st_search.result.name, db_name);
     printf("====================================================================================================\n");
     printf("  Diretório Controle : %s\n", ctrl_dir);
-    printf("  Tablespace         : %s (Tablespace ID = %d)\n", target_tbsp_name, st_search.result.tbsp_id);
-    printf("  Container Físico   : %s\n", target_cont_path);
-    printf("  Object ID (FID)    : %d (Data EMP = Pool Page %u | %u página(s) de dados de 4KB)\n",
-           st_search.result.obj_id, data_emp, phys_total_pages);
+    printf("  Tablespace         : %s (ID = %d | PageSize = %u B | ExtentSize = %u | %u Container(s))\n",
+           tbl_ctx.name, st_search.result.tbsp_id, tbl_ctx.page_size, tbl_ctx.extent_size, tbl_ctx.num_containers);
+    for (uint32_t c = 0; c < tbl_ctx.num_containers; c++) {
+        printf("  Container [%u]       : %s\n", c, tbl_ctx.containers[c].path);
+    }
+    printf("  Object ID (FID)    : %d (Data EMP = Pool Page %u | %u página(s) de dados de %u KB)\n",
+           st_search.result.obj_id, data_emp, phys_total_pages, tbl_ctx.page_size / 1024);
     printf("  Colunas / Linhas   : %u colunas | Cardinalidade Catálogo = %lld\n\n",
            phys_num_cols, (long long)st_search.result.card);
 
@@ -951,10 +938,10 @@ int main(int argc, char **argv) {
         printf("  >> %llu registro(s) exibido(s) (limitado a %llu linhas).\n\n",
                (unsigned long long)pctx.rows_printed, (unsigned long long)max_rows);
     } else {
-        printf("  >> Total de %llu registro(s) lido(s) diretamente do container.\n\n",
+        printf("  >> Total de %llu registro(s) lido(s) diretamente do(s) container(s).\n\n",
                (unsigned long long)pctx.rows_printed);
     }
 
-    close_container(&tbl_ctx);
+    close_tablespace(&tbl_ctx);
     return 0;
 }

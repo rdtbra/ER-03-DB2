@@ -973,14 +973,7 @@ static int inspect_sqlspcs_file(const char *path) {
         uint32_t max_pgs       = *(const uint32_t *)(slot_buf + 0x04AC);
         int16_t  sgid          = *(const int16_t  *)(slot_buf + 0x04F2);
 
-        /* Container 0 no offset +0xC000 do slot */
-        const uint8_t *c0      = slot_buf + 0xC000;
-        uint32_t c0_type       = *(const uint32_t *)(c0 + 0x00);
-        uint32_t c0_total_pgs  = *(const uint32_t *)(c0 + 0x04);
-        uint32_t c0_use_pgs    = *(const uint32_t *)(c0 + 0x08);
-        int32_t  c0_path_id    = *(const int32_t  *)(c0 + 0x30);
-        const char *c0_path    = (const char *)(c0 + 0x34);
-
+        /* Containers no offset +0xC000 do slot */
         const char *type_desc = "DMS Regular";
         if (tbsp_flags == 0x6112) type_desc = "DMS System Temporary";
         else if (tbsp_flags == 0x3122) type_desc = "DMS Large (Automatic Storage)";
@@ -1005,9 +998,22 @@ static int inspect_sqlspcs_file(const char *path) {
             printf("%u (%.2f GB)\n", max_pgs, (double)max_pgs * page_size / (1024.0 * 1024.0 * 1024.0));
         }
         printf("    Creation LSN       : 0x%016llX\n", (unsigned long long)create_lsn);
-        printf("    Containers (%u)     : [Container #0 em +0xC000: Tipo=%u, TotalPgs=%u, UseablePgs=%u, PathID=%d]\n",
-               num_conts, c0_type, c0_total_pgs, c0_use_pgs, c0_path_id);
-        printf("                         Caminho: %s\n\n", c0_path);
+        printf("    Containers (%u)     :\n", num_conts);
+        const uint8_t *curr_c = slot_buf + 0xC000;
+        for (uint32_t c = 0; c < num_conts; c++) {
+            if ((curr_c - slot_buf) + 0x34 >= SQLSPCS_SLOT_SIZE) break;
+            uint32_t c_type      = *(const uint32_t *)(curr_c + 0x00);
+            uint32_t c_total_pgs = *(const uint32_t *)(curr_c + 0x04);
+            uint32_t c_use_pgs   = *(const uint32_t *)(curr_c + 0x08);
+            int32_t  c_path_id   = *(const int32_t  *)(curr_c + 0x30);
+            const char *c_path   = (const char *)(curr_c + 0x34);
+            printf("      [Container #%u em +0x%04lX: Tipo=%u, TotalPgs=%u, UseablePgs=%u, PathID=%d]\n",
+                   c, (unsigned long)(curr_c - slot_buf), c_type, c_total_pgs, c_use_pgs, c_path_id);
+            printf("        Caminho: %s\n", c_path);
+            size_t path_len = strlen(c_path);
+            curr_c += 0x34 + path_len + 1;
+        }
+        printf("\n");
     }
 
     free(slot_buf);
