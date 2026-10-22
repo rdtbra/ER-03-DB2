@@ -785,3 +785,181 @@ O utilitário autônomo [`db2_select.c`](file:///desenv/db2/db2_select.c) foi in
 1. **Detecção e Reconstituição Automática do Dicionário:** Ao abrir a tabela, inspeciona o Slot 4 da Página 0; se `Flags & 0x0040`, carrega e concatena os 16 blocos das Páginas 0 a 15, montando em memória a tabela `SPBINEXPDICT` de 32 KB e o descritor `SQLD_TCB_DICT_INFO`.
 2. **Descompressão Transparente:** Ao encontrar registros marcados com o bit `0x0080` em `rec_flags`, aciona a expansão do stream de dados comprimidos (`rec + 8`), extrai as strings reais das colunas textuais (`NOME`, `CIDADE`, `ESTADO`, `OBS`) e os valores numéricos (`ID`).
 3. **Validação Prática:** Testado com sucesso total em `ERP.TAB_COMP_STATIC` (2.500 linhas comprimidas em disco no container `C0000000.LRG`), imprimindo os textos reais de empresas e cidades com redução de 82% do tamanho físico em disco.
+
+---
+
+## 16. Mapeamento Físico de Índices B+ Tree (Index EMP, Páginas de Índice, Nós Raiz/Folha, Chaves e RIDs)
+
+### 16.1 Visão Geral e Arquitetura do Subsistema de Índices (IXM / `sqli`)
+O armazenamento de índices no IBM Db2 LUW é gerenciado pelo componente de gerenciamento de índices (**IXM — Index Manager**), implementado internamente pelo prefixo `sqli` na biblioteca do motor (`libdb2e.so`).
+
+No Db2, os índices são organizados como árvores **B+ Tree**, caracterizadas por:
+1. **Nós Folha (`Leaf Nodes`):** Contêm todas as chaves ordenadas e os apontadores físicos de linha (**RID — Record Identifier** de 6 bytes). Estão conectados entre si em uma **lista duplamente ligada** (`prev_leaf_page` e `next_leaf_page`), permitindo varreduras sequenciais de intervalos (*Range Scans*) sem necessidade de retornar à raiz.
+2. **Nós Galho e Raiz (`Branch / Root Nodes`):** Contêm chaves discriminadoras de roteamento (**High Keys**) associadas aos apontadores de páginas filhas (`child_page_num`), dividindo o espaço de chaves hierarquicamente em tempo logarítmico $O(\log N)$.
+3. **Página Especial de Descritor de Raiz (`Root Vector Page — RT10`):** Contém os metadados de ancoragem da árvore, o apontador para a primeira página folha e as estatísticas estruturais.
+4. **Página de Mapa de Espaço do Índice (`Index SMP`):** Rastreia o bitmap de alocação de páginas exclusivas do objeto de índice.
+
+---
+
+### 16.2 Localização do Objeto de Índice no Catálogo e na Object Table (`0xFFFF`)
+
+No Db2 DMS (Database Managed Space), tanto os dados quanto os índices compartilham os mesmos containers físicos da Tablespace, mas residem em **Objetos Lógicos Independentes**.
+
+#### 1. Registro de Objeto na Object Table (`0xFFFF`)
+Cada tabela possui uma entrada na Object Table (`bps->object_id = 0xFFFF`, `rec_type = 0x0010`, tamanho de 152 bytes = `0x98`):
+
+```
++0x00 (2B): rec_type = 0x0010
++0x02 (2B): rec_len  = 0x0098 (152 bytes)
++0x08 (2B): Tablespace ID (ex: 4)
++0x0A (2B): Target Object ID / FID (ex: 7 para ERP.CLIENTE)
++0x0C (4B): Data EMP Pool Page (Extents de Dados, ex: 480)
+...
++0x2C (2B): Tablespace ID do Índice (ex: 4)
++0x2E (2B): Target Object ID do Índice (ex: 7)
++0x30 (4B): Index EMP Pool Page (Extents de Índice, ex: 544)
++0x38 (4B): Index ID / Version (ex: 0x00010001)
+```
+
+#### 2. Index EMP Page (`obj_type = 0x41`)
+A página apontada pelo offset `+0x30` é a **Index Extent Map Page (Index EMP)**:
+* `bps->obj_type`: `0x41` (EMP de Índice, diferenciando-se de `0x40` que é a EMP de Dados).
+* `bps->object_id`: FID da tabela correspondente.
+* A partir do offset `+0x58`, contém o array sequencial de extents físicos alocados exclusivamente para as páginas da árvore B+ do índice:
+  $$\text{Array de Extents: } [e_0, e_1, e_2, \dots] \quad (\text{onde } e_i = \text{Pool Page inicial do extent})$$
+
+---
+
+### 16.3 Tipos e Papéis das Páginas Lógicas do Índice (`bps->obj_page_num`)
+
+As páginas alocadas para o índice são numeradas logicamente a partir de 0 (`bps->obj_page_num` no BPS Header, com `bps->obj_type = 0x01`):
+
+| Página Lógica | Nome do Componente | Descrição Funcional |
+|:---:|:---|:---|
+| **Página 0** | **Index SMP (Space Map Page)** | Contém metadados de alocação de páginas do índice e o bitmap contínuo de páginas ativas a partir do offset `+0x80` (`0x10` = página ocupada). |
+| **Página 1** | **Root Vector Page (`RT10`)** | Contém o identificador mágico ASCII `RT10` no offset `+0x56`, ponteiro para a primeira página folha (`child = 4`) e estatísticas do índice. |
+| **Página 2** | **Root Node (Nó Raiz da B+ Tree)** | Raiz da árvore de busca. Possui `node_type = 0x01` e `tree_level \ge 2`. Armazena as HighKeys e os ponteiros para os nós filhos. |
+| **Página 3** | **Index Control Page / Reserved** | Página de controle reservada para operações de rebalanceamento e reorganização de splits concorrentes. |
+| **Páginas $\ge 4$** | **Leaf Nodes & Branch Nodes** | Nós folhas (`tree_level = 1`, `node_type = 0x04`) e nós intermediários (`tree_level > 1`) da B+ Tree. |
+
+---
+
+### 16.4 Estrutura Binária do Cabeçalho da Página de Índice (`db2_index_page_hdr_t`)
+
+A partir do offset `+0x30` de qualquer página de índice (imediatamente após os 48 bytes do cabeçalho BPS), localiza-se o cabeçalho estrutural do nó da B+ Tree:
+
+```c
+#pragma pack(push, 1)
+
+typedef struct {
+    uint16_t key_count;       /* +0x30: Quantidade de chaves ativas no nó folha */
+    uint16_t free_space;      /* +0x32: Espaço livre não fragmentado em bytes */
+    uint8_t  node_type;       /* +0x34: 0x01 = Root/Branch Node, 0x04 = Leaf Node */
+    uint8_t  flags;           /* +0x35: Flags de controle do nó (ex: 0x02) */
+    uint16_t unused1;         /* +0x36: Flags estendidas */
+    uint32_t unused2;         /* +0x38 */
+    uint32_t unused3;         /* +0x3C */
+    uint32_t unused4;         /* +0x40 */
+    uint32_t tree_level;      /* +0x44: Nível da B-Tree (1 = Folha, 2 = Raiz/Galho, >=3 Multinível) */
+    uint32_t next_leaf_page;  /* +0x48: Número lógico da próxima página folha (0 = última folha) */
+    uint32_t prev_leaf_page;  /* +0x4C: Número lógico da página folha anterior (0 = primeira folha) */
+} db2_index_page_hdr_t;
+
+#pragma pack(pop)
+```
+
+---
+
+### 16.5 Estrutura dos Registros de Chave e do RID de 6 Bytes
+
+#### 1. Registros nos Nós Folha (`Leaf Nodes` — `node_type = 0x04`)
+* **Diretório de Slots:** Começa no offset fixo **`0x60`** da página. É composto por um array ordenado de `uint16_t slot_offset[key_count]`, onde cada elemento contém o offset absoluto da entrada dentro da página.
+* **Formato da Entrada no Nó Folha:**
+  ```
+  +0x00 (2B): uint16_t entry_len (Tamanho total da entrada, ex: 17 bytes = 0x0011)
+  +0x02 (NB): Colunas da Chave Primária / Índice em Little-Endian (ex: EMP_COD + CLI_COD = 4B + 4B)
+  +0x0A (2B): uint16_t rid_slot_number (Slot da linha na página de dados)
+  +0x0C (4B): uint32_t rid_obj_page_num (Página lógica dentro do objeto de dados)
+  +0x10 (1B): uint8_t  rid_flags (Flag do tipo de RID, ex: 0x02)
+  ```
+* **O RID de 6 Bytes do Db2:**
+  $$\mathbf{RID} = (\mathtt{slot\_number} \ [2 \text{ bytes}], \ \mathtt{obj\_page\_num} \ [4 \text{ bytes}])$$
+  Para converter a página lógica `obj_page_num` na Pool Page física da Tablespace:
+  $$\mathtt{ext\_idx} = \frac{\mathtt{obj\_page\_num}}{\mathtt{extent\_size}}, \quad \mathtt{pg\_in\_ext} = \mathtt{obj\_page\_num} \pmod{\mathtt{extent\_size}}$$
+  $$\mathtt{pool\_page} = \mathtt{data\_extents}[\mathtt{ext\_idx}] + \mathtt{pg\_in\_ext}$$
+
+#### 2. Registros nos Nós Galho e Raiz (`Branch / Root Nodes` — `node_type = 0x01`)
+* **Contagem e Diretório de Slots:** O número de slots ativos fica gravado no offset **`0xC2`**, e o array de slots começa no offset **`0xC4`**.
+* **Formato da Entrada no Nó Branch (20 Bytes):**
+  ```
+  +0x00 (2B): uint16_t entry_len = 0x0014 (20 bytes)
+  +0x02 (NB): Colunas da HighKey (Valor máximo indexado na subárvore filha)
+  +0x0A (6B): Dummy RID Coringa (0xFF 0xFF 0xFF 0xFF 0xFF 0xFF)
+  +0x10 (4B): uint32_t child_page_num (Número lógico da página filha na B+ Tree)
+  ```
+* **Dummy High Key / Rightmost Child (8 Bytes):**
+  A última entrada do diretório no nó galho (offset com tamanho de 8 bytes) armazena o ponteiro para a subárvore mais à direita:
+  ```
+  +0x00 (2B): uint16_t entry_len = 0x0008 (8 bytes)
+  +0x02 (2B): flags / type = 0x0001
+  +0x04 (4B): uint32_t rightmost_child_page (Página folha com as maiores chaves)
+  ```
+
+---
+
+### 16.6 Algoritmos de Busca Pontual $O(\log N)$ e Range Scan Sequencial
+
+#### 1. Algoritmo de Busca Pontual por Chave Primária $K$
+1. **Ponto de Partida:** Iniciar a navegação na **Página Lógica 2** (Nó Raiz da B+ Tree).
+2. **Descida na Árvore (`Branch Traversal`):**
+   * Se `node_type == 0x01` (`tree_level > 1`):
+     * Ler os slots a partir de `0xC4`.
+     * Percorrer as entradas procurando a primeira cujo valor de chave $\ge K$.
+     * Se encontrada uma entrada com HighKey $\ge K$, extrair `child_page = entry + 16`.
+     * Se $K$ for maior que todas as HighKeys normais, adotar o ponteiro da entrada sentinela de 8 bytes (`entry + 4`).
+     * Recursivamente carregar a página `child_page` e repetir o processo até atingir `tree_level == 1`.
+3. **Busca Binária na Folha (`Leaf Binary Search`):**
+   * Na folha (`tree_level == 1`), ler os slots a partir de `0x60`.
+   * Realizar busca binária no array `slots[0 .. key_count - 1]` comparando a chave desejada $K$ com a chave armazenada em `page + slot_off + 2`.
+   * Se $\text{chave} == K$: extrair o RID (`slot` em `+10` e `obj_page_num` em `+12`).
+4. **Acesso Direto ao Registro $O(1)$:**
+   * Mapear `obj_page_num` para a Pool Page física via Data EMP.
+   * Carregar a página de dados e saltar diretamente para o slot indicado no diretório de slots (`0x44 + slot * 2`), obtendo a linha física sem escanear a tabela.
+
+#### 2. Algoritmo de Range Scan Sequencial (Varredura de Intervalos)
+1. Localizar a folha contendo a chave inicial $K_{start}$ via busca pontual.
+2. Ler sequencialmente os slots da folha até a borda final.
+3. Avançar para a folha seguinte através do ponteiro `next_leaf_page` gravado no cabeçalho em `+0x48`.
+4. Repetir a leitura contígua até atingir a chave limite $K_{end}$ ou encontrar `next_leaf_page == 0` (fim da lista ligada), sem necessidade de retroceder aos níveis superiores da B-Tree.
+
+---
+
+### 16.7 Comprovação Prática e Validação dos Testes
+
+O mecanismo foi validado experimentalmente com o programa autônomo [`test_keys.c`](file:///desenv/db2/test_keys.c) na tabela `ERP.CLIENTE` (índice primário `PK_CLIENTE`, 5.000 linhas):
+
+```
+================================================================================
+ TESTE EM MASSA DE BUSCA B+ TREE DB2 — ERP.CLIENTE (5.000 LINHAS)
+================================================================================
+  [OK] EMP_COD=1, CLI_COD=   1 => RID=(LogPage  0, Slot  4) => Dados Lido: (1, 1)
+  [OK] EMP_COD=1, CLI_COD=   2 => RID=(LogPage  0, Slot  5) => Dados Lido: (1, 2)
+  [OK] EMP_COD=1, CLI_COD=  50 => RID=(LogPage  1, Slot  8) => Dados Lido: (1, 50)
+  [OK] EMP_COD=1, CLI_COD= 189 => RID=(LogPage  3, Slot 29) => Dados Lido: (1, 189)
+  [OK] EMP_COD=1, CLI_COD= 190 => RID=(LogPage  3, Slot 30) => Dados Lido: (1, 190)
+  [OK] EMP_COD=1, CLI_COD= 203 => RID=(LogPage  3, Slot 43) => Dados Lido: (1, 203)
+  [OK] EMP_COD=1, CLI_COD= 500 => RID=(LogPage  8, Slot 45) => Dados Lido: (1, 500)
+  [OK] EMP_COD=1, CLI_COD=1000 => RID=(LogPage 17, Slot 14) => Dados Lido: (1, 1000)
+  [OK] EMP_COD=1, CLI_COD=2500 => RID=(LogPage 42, Slot 39) => Dados Lido: (1, 2500)
+  [OK] EMP_COD=1, CLI_COD=4500 => RID=(LogPage 76, Slot 33) => Dados Lido: (1, 4500)
+  [OK] EMP_COD=1, CLI_COD=4914 => RID=(LogPage 83, Slot 34) => Dados Lido: (1, 4914)
+  [OK] EMP_COD=1, CLI_COD=4915 => RID=(LogPage 83, Slot 35) => Dados Lido: (1, 4915)
+  [OK] EMP_COD=1, CLI_COD=4999 => RID=(LogPage 85, Slot  1) => Dados Lido: (1, 4999)
+  [OK] EMP_COD=1, CLI_COD=5000 => RID=(LogPage 85, Slot  2) => Dados Lido: (1, 5000)
+================================================================================
+ Resultado: 14 de 14 testes passaram com 100% de precisão!
+================================================================================
+```
+
+E a lista ligada bidirecional das 27 folhas foi percorrida de ponta a ponta via `next_leaf_page` (`4 -> 5 -> ... -> 30 -> 0`), lendo todas as 5.000 chaves de forma puramente contígua.
+
