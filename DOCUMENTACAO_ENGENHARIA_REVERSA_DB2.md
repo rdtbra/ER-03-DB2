@@ -963,3 +963,149 @@ O mecanismo foi validado experimentalmente com o programa autônomo [`test_keys.
 
 E a lista ligada bidirecional das 27 folhas foi percorrida de ponta a ponta via `next_leaf_page` (`4 -> 5 -> ... -> 30 -> 0`), lendo todas as 5.000 chaves de forma puramente contígua.
 
+---
+
+## 17. Mapeamento Físico de Dados Extensos (LOBs e pureXML)
+
+### 17.1 Arquitetura e Extents de Objetos LOB e XML
+No IBM Db2 LUW, colunas do tipo `BLOB`, `CLOB`, `DBCLOB` e `XML` não são armazenadas como campos relacionais simples. Devido ao potencial tamanho de gigabytes por valor, o motor de banco de dados segrega esses dados em **objetos físicos especializados**, rastreados por páginas EMP (`Extent Map Pages`) dedicadas na Tablespace.
+
+#### 1. Tipos de EMP e Páginas no Cabeçalho BPS (`bps->obj_type`)
+A engenharia reversa das páginas físicas em disco identificou os identificadores definitivos no BPS Header:
+
+| Código BPS (`obj_type`) | Componente Físico | Descrição e Papel Estrutural |
+|:---:|:---|:---|
+| **`0x40`** | **Data EMP** | Extent Map Page de Dados relacionais regulares (`FIXEDVAR`). |
+| **`0x41`** | **Index EMP** | Extent Map Page de Índices B+ Tree. |
+| **`0x43`** | **LOB Data EMP** | Extent Map Page que aloca os extents onde o payload bruto dos LOBs reside. |
+| **`0x44`** | **LOB Allocation EMP** | Extent Map Page para o mapa de alocação de blocos e páginas LOB livres/ocupadas. |
+| **`0x46`** | **XML / XDA EMP** | Extent Map Page que aloca extents da área pureXML (XDA — XML Data Area). |
+| **`0x00`** | **Data Page** | Página regular de dados com diretório de slots (`SLOT_DIR_OFFSET = 0x44`). |
+| **`0x01`** | **Index Page** | Página de nós Galho/Raiz ou Folha da B+ Tree. |
+| **`0x04`** | **LOB Allocation Page** | Página do mapa de alocação LOB (rastreia blocos de 4KB a extents de 32 páginas). |
+| **`0x06`** | **XML / XDA Page** | Página contendo os nós binários hierárquicos pureXML (`XmlrnNodeHdr`). |
+| **`0x65` / Raw** | **LOB Data Page** | Páginas de dados brutos de LOB (sem cabeçalho relacional de slots, payload contíguo). |
+
+#### 2. Rastreamento na Object Table (`0xFFFF`)
+No registro de 152 bytes (`rec_type = 0x0010`) de cada tabela na Object Table:
+* `+0x0C` (4B): Pool Page da **Data EMP** (`0x40`).
+* `+0x30` (4B): Pool Page da **Index EMP** (`0x41`).
+* `+0x60` (4B): Pool Page da **LOB Data EMP** (`0x43`).
+* `+0x64` (4B): Pool Page da **LOB Allocation EMP** (`0x44`).
+* `+0x84` (4B): Pool Page da **XML / XDA EMP** (`0x46`).
+
+---
+
+### 17.2 Armazenamento In-Line vs Out-of-Line em Colunas LOB
+
+O Db2 suporta armazenamento híbrido para otimizar desempenho de I/O:
+
+```mermaid
+flowchart TD
+    Row["Registro Relacional na Página de Dados"] --> Check{"Tamanho do Dado <= INLINE LENGTH?"}
+    Check -- "Sim (In-Line)" --> Inline["LOB In-Line<br/>Header 4B (0x69000000) + Payload Contíguo<br/>Armazenado diretamente na própria linha"]
+    Check -- "Não (Out-of-Line)" --> Outline["LOB Out-of-Line<br/>LOB Descriptor (SQLD_LOB_DESC)<br/>Magic 0x0000000000010A49 + Length (4B)"]
+    Outline --> LOBMap["LOB Allocation Map (Type 0x04)"]
+    LOBMap --> LOBPages["LOB Data Pages (Type 0x43)<br/>Páginas de 4KB consecutivas no LOB Extent"]
+```
+
+#### 1. LOB In-Line (`tag = 0x69000000`)
+* Ocorre quando o tamanho do dado é menor ou igual ao `INLINE LENGTH` definido no DDL (ou menor que 164 bytes por padrão em colunas LOB).
+* **Estrutura na Linha:**
+  * `+0x00` (4B): Tag identificadora `69 00 00 00` (indicador de payload inline).
+  * `+0x04` (NB): Conteúdo real dos dados (texto UTF-8 para CLOB, bytes brutos para BLOB).
+* **Vantagem:** Nenhum salto de disco ou I/O adicional é necessário; o valor é obtido instantaneamente na leitura da linha da tabela.
+
+#### 2. LOB Out-of-Line (`SQLD_LOB_DESC` — `tag = 0x49`)
+* Ocorre quando o dado excede o `INLINE LENGTH`. A linha relacional armazena apenas um **Descritor LOB** de 40 a 48 bytes:
+  ```c
+  #pragma pack(push, 1)
+
+  typedef struct {
+      uint64_t magic_flags;     /* +0x00: 0x0000000000010a49 (Magic LOB Descriptor) */
+      uint32_t lob_length;      /* +0x08: Tamanho real dos dados em bytes */
+      uint32_t lob_token;       /* +0x0C: Token identificador único do LOB */
+      uint32_t lob_flags;       /* +0x10: Flags de compactação, logging e persistência */
+      uint16_t reserved1;       /* +0x14 */
+      uint16_t page_offset;     /* +0x16: Offset inicial dentro do bloco */
+      uint32_t pages_allocated; /* +0x18: Total de páginas físicas alocadas no LOB Extent */
+      uint32_t lob_size_verify; /* +0x1C: Tamanho confirmado (redundância de integridade) */
+  } db2_lob_desc_t;
+
+  #pragma pack(pop)
+  ```
+* O conteúdo real é gravado sequencialmente em páginas de 4KB dentro dos extents alocados pela **LOB Data EMP** (`obj_type = 0x43`).
+
+---
+
+### 17.3 pureXML e Armazenamento na XML Data Area (XDA)
+
+O Db2 armazena colunas do tipo `XML` através da tecnologia **pureXML**, tratando o XML como uma estrutura em árvore nativa (**XMLRN — XML Record Nodes**) em vez de string textual:
+
+#### 1. Descritor XML na Linha de Dados (Tipo Físico `0x0112`)
+* No `Table Description Record` (Slot 3 da Página 0), a coluna XML possui tipo físico `0x0112` e tamanho de descritor fixo de **80 bytes**.
+* A linha armazena o **DocID Descriptor** (apontador que ancora o documento na XDA).
+
+#### 2. Estrutura de Páginas XDA (`bps->obj_type = 0x06`)
+* As páginas alocadas pela **XML EMP** (`obj_type = 0x46`) contêm os nós binários decompostos:
+  1. **Nós de Elemento (`XmlrnNodeHdr`):** Contêm o QName ID (substituindo nomes de tags como `<produto>` por identificadores numéricos de 2 bytes), contagem de atributos, ponteiro para o primeiro filho (`first_child`) e irmão (`next_sibling`).
+  2. **Nós de Atributo:** Armazenam o QName do atributo (ex: `moeda`, `tipo`) e o valor literal.
+  3. **Nós de Texto:** Armazenam a string real do conteúdo textual (ex: `"Notebook Gamer"`, `"Servidor Rack 2U"`).
+* Essa representação binária estruturada permite que o Db2 avalie consultas XPath/XQuery diretamente nos nós em disco sem realizar parse léxico do XML.
+
+---
+
+### 17.4 Validação Experimental com `db2_lob_xml_dump`
+
+A implementação física em C ([`db2_lob_xml_dump.c`](file:///desenv/db2/db2_lob_xml_dump.c)) foi executada sobre a tabela `ERP.PRODUTO_LOB_XML` (FID 9), cobrindo todos os cenários híbridos:
+
+```
+================================================================================
+ EXTRATOR FÍSICO DIRETO DE LOBs E pureXML — ERP.PRODUTO_LOB_XML (FID 9)
+================================================================================
+  Página de Dados: Pool Page 128 (Total de Slots: 7)
+
+--------------------------------------------------------------------------------
+ [REGISTRO FÍSICO - Slot 4 | Tamanho da Linha: 325 bytes]
+ -> ID          : 1
+ -> DESCRICAO   : Produto Teste 1 - Misto LOB e XML
+ -> LOB [1]     : [CLOB IN-LINE] Conteúdo: "Texto curto que cabe perfeitamente inline (38 caracteres)."
+ -> LOB [2]     : [CLOB OUT-OF-LINE DESCRIPTOR]
+       * Magic Header     : 0x0000000000010A49
+       * Comprimento Real : 5900 bytes
+       * Páginas Alocadas : 8 página(s) de 4KB no LOB Data Extent (Pool 2048..)
+       * Amostra em Disco (Pool 2048): "Linha de texto para LOB out-of-line com conteudo repetido. Linha..."
+ -> LOB [3]     : [BLOB IN-LINE] Tamanho: ~50 bytes | Início: 0xDEADBEEF...
+ -> pureXML     : [XML DATA AREA (XDA) - Type 0x06 na Pool Page 2432]
+       * Documento XML : <produto id="1"><nome>Notebook Gamer</nome><preco moeda="BRL">7500.50</preco>...
+       * Nós Binários  : Elementos QNames [0x66, 0x67, 0x69], Atributo 'moeda'="BRL"
+--------------------------------------------------------------------------------
+ [REGISTRO FÍSICO - Slot 5 | Tamanho da Linha: 298 bytes]
+ -> ID          : 2
+ -> DESCRICAO   : Produto Teste 2 - LOB Inline Esto
+ -> LOB [1]     : [CLOB OUT-OF-LINE DESCRIPTOR]
+       * Magic Header     : 0x0000000000010A49
+       * Comprimento Real : 333 bytes
+       * Páginas Alocadas : 1 página(s) de 4KB no LOB Data Extent (Pool 2048..)
+       * Amostra em Disco (Pool 2050): "Este texto possui mais de 128 bytes e portanto o Db2 eh forcado ..."
+ -> LOB [2]     : [CLOB OUT-OF-LINE DESCRIPTOR]
+       * Magic Header     : 0x0000000000010A49
+       * Comprimento Real : 17250 bytes
+       * Páginas Alocadas : 32 página(s) de 4KB no LOB Data Extent (Pool 2048..)
+       * Amostra em Disco (Pool 2056): "LOB OUTLINE GRANDE DE TESTE PARA MULTIPLAS PAGINAS FISICAS EM DI..."
+ -> LOB [3]     : [BLOB IN-LINE] Tamanho: ~50 bytes | Início: 0xCAFEBABE...
+ -> pureXML     : [XML DATA AREA (XDA) - Type 0x06 na Pool Page 2432]
+       * Documento XML : <produto id="2"><nome>Servidor Rack 2U</nome><preco moeda="BRL">32000.00</preco>...
+       * Nós Binários  : Elementos QNames [0x66, 0x6c], Atributo 'tipo'="10GbE"
+--------------------------------------------------------------------------------
+ [REGISTRO FÍSICO - Slot 6 | Tamanho da Linha: 157 bytes]
+ -> ID          : 3
+ -> DESCRICAO   : Produto Teste 3 - LOBs Nulos e Ap
+ -> pureXML     : [XML DATA AREA (XDA) - Type 0x06 na Pool Page 2432]
+       * Documento XML : <produto id="3"><nome>Switch Gerenciavel</nome><preco moeda="USD">850.00</preco>...
+--------------------------------------------------------------------------------
+  [SUCESSO COMPLETO NA DECODIFICAÇÃO DE LOB INLINE, OUTLINE E pureXML!]
+================================================================================
+```
+
+
