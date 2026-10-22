@@ -237,9 +237,27 @@ static void format_column_value(const uint8_t *rec, uint16_t rec_len,
     bool nullable = (col->null_flags == 0x0001);
 
     uint16_t fixed_width = col->col_len;
-    if (col->col_type == 0x0101) fixed_width = 4;
-    else if (col->col_type == 0x0107) fixed_width = 10;
-    else if (col->col_type == 0x0108 || col->col_type == 0x0109) fixed_width = 4;
+    if (col->col_type == 0x0002) {
+        /* DECIMAL: precisão nos 8 bits baixos */
+        uint8_t prec = (uint8_t)(col->col_len & 0xFF);
+        fixed_width = (prec / 2) + 1;
+    } else if (col->col_type == 0x0006) {
+        fixed_width = 8;  /* DECFLOAT(16) */
+    } else if (col->col_type == 0x0007) {
+        fixed_width = 16; /* DECFLOAT(34) */
+    } else if (col->col_type == 0x0101 || col->col_type == 0x0111 || col->col_type == 0x0201) {
+        fixed_width = 4;  /* VARCHAR, VARBINARY, VARGRAPHIC */
+    } else if (col->col_type == 0x0106) {
+        fixed_width = 3;  /* TIME */
+    } else if (col->col_type == 0x0107) {
+        /* TIMESTAMP(p) */
+        uint8_t prec = (uint8_t)((col->col_len >> 8) & 0xFF);
+        fixed_width = 7 + (prec + 1) / 2;
+    } else if (col->col_type == 0x0108 || col->col_type == 0x0109) {
+        fixed_width = 4;  /* LOB */
+    } else if (col->col_type == 0x010F) {
+        fixed_width = 1;  /* BOOLEAN */
+    }
 
     if (8 + col->fixed_offset + fixed_width + (nullable ? 1 : 0) > rec_len) {
         snprintf(out_buf, out_sz, "?");
@@ -261,6 +279,40 @@ static void format_column_value(const uint8_t *rec, uint16_t rec_len,
         case 0x0001: /* INTEGER */
             snprintf(out_buf, out_sz, "%d", *(const int32_t *)val_ptr);
             break;
+        case 0x0002:
+        case 0x0104: { /* DECIMAL Packed BCD */
+            uint8_t prec = (uint8_t)(col->col_len & 0xFF);
+            uint8_t sc   = (uint8_t)((col->col_len >> 8) & 0xFF);
+            if (scale >= 0) sc = (uint8_t)scale;
+
+            char digits[64];
+            int dlen = 0;
+            for (uint16_t k = 0; k < fixed_width && dlen + 2 < (int)sizeof(digits); k++) {
+                uint8_t hi = (val_ptr[k] >> 4) & 0x0F;
+                uint8_t lo = val_ptr[k] & 0x0F;
+                digits[dlen++] = (char)('0' + hi);
+                if (k < fixed_width - 1) digits[dlen++] = (char)('0' + lo);
+            }
+            digits[dlen] = '\0';
+            uint8_t sign_nib = val_ptr[fixed_width - 1] & 0x0F;
+            bool neg = (sign_nib == 0x0D || sign_nib == 0x0B);
+
+            int int_part_len = dlen - (sc > 0 ? sc : 0);
+            int start = 0;
+            while (start < int_part_len - 1 && digits[start] == '0') start++;
+
+            size_t pos = 0;
+            if (neg && pos + 1 < out_sz) out_buf[pos++] = '-';
+            for (int i = start; i < int_part_len && pos + 1 < out_sz; i++) out_buf[pos++] = digits[i];
+            if (sc > 0 && pos + 1 < out_sz) {
+                out_buf[pos++] = '.';
+                for (int i = int_part_len; i < dlen && pos + 1 < out_sz; i++) {
+                    out_buf[pos++] = (i >= 0) ? digits[i] : '0';
+                }
+            }
+            out_buf[pos] = '\0';
+            break;
+        }
         case 0x0003:
         case 0x0004: /* REAL (4B float) ou DOUBLE (8B double) */
             if (fixed_width == 8) {
@@ -272,6 +324,15 @@ static void format_column_value(const uint8_t *rec, uint16_t rec_len,
         case 0x0005: /* BIGINT */
             snprintf(out_buf, out_sz, "%lld", (long long)*(const int64_t *)val_ptr);
             break;
+        case 0x0006:
+        case 0x0007: { /* DECFLOAT(16) e DECFLOAT(34) */
+            size_t pos = (size_t)snprintf(out_buf, out_sz, "DF(0x");
+            for (int k = (int)fixed_width - 1; k >= 0 && pos + 3 < out_sz; k--) {
+                pos += (size_t)snprintf(out_buf + pos, out_sz - pos, "%02X", val_ptr[k]);
+            }
+            snprintf(out_buf + pos, out_sz - pos, ")");
+            break;
+        }
         case 0x0100: { /* CHAR */
             int len = col->col_len;
             while (len > 0 && val_ptr[len - 1] == ' ') len--;
@@ -300,49 +361,91 @@ static void format_column_value(const uint8_t *rec, uint16_t rec_len,
             }
             break;
         }
-        case 0x0105: /* DATE (Packed BCD: YYYYMMDD) */
+        case 0x0105: /* DATE (4B BCD: YYYYMMDD) */
             snprintf(out_buf, out_sz, "%02X%02X-%02X-%02X",
                      val_ptr[0], val_ptr[1], val_ptr[2], val_ptr[3]);
             break;
-        case 0x0107: /* TIMESTAMP (10B Packed BCD) */
-            snprintf(out_buf, out_sz, "%02X%02X-%02X-%02X %02X:%02X:%02X.%02X%02X%02X",
-                     val_ptr[0], val_ptr[1], val_ptr[2], val_ptr[3],
-                     val_ptr[4], val_ptr[5], val_ptr[6],
-                     val_ptr[7], val_ptr[8], val_ptr[9]);
+        case 0x0106: /* TIME (3B BCD: HHMMSS) */
+            snprintf(out_buf, out_sz, "%02X:%02X:%02X",
+                     val_ptr[0], val_ptr[1], val_ptr[2]);
             break;
-        case 0x0104: { /* DECIMAL Packed BCD */
-            char digits[64];
-            int dlen = 0;
-            for (uint16_t k = 0; k < fixed_width && dlen + 2 < (int)sizeof(digits); k++) {
-                uint8_t hi = (val_ptr[k] >> 4) & 0x0F;
-                uint8_t lo = val_ptr[k] & 0x0F;
-                digits[dlen++] = (char)('0' + hi);
-                if (k < fixed_width - 1) digits[dlen++] = (char)('0' + lo);
+        case 0x0107: { /* TIMESTAMP(p) */
+            if (fixed_width == 7) {
+                snprintf(out_buf, out_sz, "%02X%02X-%02X-%02X %02X:%02X:%02X",
+                         val_ptr[0], val_ptr[1], val_ptr[2], val_ptr[3],
+                         val_ptr[4], val_ptr[5], val_ptr[6]);
+            } else if (fixed_width == 10) {
+                snprintf(out_buf, out_sz, "%02X%02X-%02X-%02X %02X:%02X:%02X.%02X%02X%02X",
+                         val_ptr[0], val_ptr[1], val_ptr[2], val_ptr[3],
+                         val_ptr[4], val_ptr[5], val_ptr[6],
+                         val_ptr[7], val_ptr[8], val_ptr[9]);
+            } else if (fixed_width >= 13) {
+                snprintf(out_buf, out_sz, "%02X%02X-%02X-%02X %02X:%02X:%02X.%02X%02X%02X%02X%02X%02X",
+                         val_ptr[0], val_ptr[1], val_ptr[2], val_ptr[3],
+                         val_ptr[4], val_ptr[5], val_ptr[6],
+                         val_ptr[7], val_ptr[8], val_ptr[9],
+                         val_ptr[10], val_ptr[11], val_ptr[12]);
             }
-            digits[dlen] = '\0';
-            uint8_t sign_nib = val_ptr[fixed_width - 1] & 0x0F;
-            bool neg = (sign_nib == 0x0D || sign_nib == 0x0B);
-
-            int int_part_len = dlen - (scale > 0 ? scale : 0);
-            int start = 0;
-            while (start < int_part_len - 1 && digits[start] == '0') start++;
-
-            size_t pos = 0;
-            if (neg && pos + 1 < out_sz) out_buf[pos++] = '-';
-            for (int i = start; i < int_part_len && pos + 1 < out_sz; i++) out_buf[pos++] = digits[i];
-            if (scale > 0 && pos + 1 < out_sz) {
-                out_buf[pos++] = '.';
-                for (int i = int_part_len; i < dlen && pos + 1 < out_sz; i++) {
-                    out_buf[pos++] = (i >= 0) ? digits[i] : '0';
-                }
-            }
-            out_buf[pos] = '\0';
             break;
         }
         case 0x0108:
         case 0x0109: { /* BLOB / CLOB */
             uint16_t lob_len = *(const uint16_t *)(val_ptr + 2);
             snprintf(out_buf, out_sz, "<LOB %uB>", lob_len);
+            break;
+        }
+        case 0x010F: /* BOOLEAN */
+            snprintf(out_buf, out_sz, "%s", (*val_ptr == 1) ? "TRUE" : "FALSE");
+            break;
+        case 0x0110: { /* BINARY */
+            size_t pos = (size_t)snprintf(out_buf, out_sz, "BX'");
+            for (uint16_t k = 0; k < fixed_width && pos + 3 < out_sz; k++) {
+                pos += (size_t)snprintf(out_buf + pos, out_sz - pos, "%02X", val_ptr[k]);
+            }
+            snprintf(out_buf + pos, out_sz - pos, "'");
+            break;
+        }
+        case 0x0111: { /* VARBINARY */
+            uint16_t var_off = *(const uint16_t *)(val_ptr + 0);
+            uint16_t var_len = *(const uint16_t *)(val_ptr + 2);
+            if (8 + var_off + var_len <= rec_len) {
+                const uint8_t *s = fixed_base + var_off;
+                size_t pos = (size_t)snprintf(out_buf, out_sz, "BX'");
+                for (uint16_t k = 0; k < var_len && pos + 3 < out_sz; k++) {
+                    pos += (size_t)snprintf(out_buf + pos, out_sz - pos, "%02X", s[k]);
+                }
+                snprintf(out_buf + pos, out_sz - pos, "'");
+            } else {
+                snprintf(out_buf, out_sz, "<varbinary>");
+            }
+            break;
+        }
+        case 0x0200: { /* GRAPHIC (UTF-16BE) */
+            size_t pos = 0;
+            for (uint16_t k = 0; k + 1 < fixed_width && pos + 1 < out_sz; k += 2) {
+                uint16_t u16 = ((uint16_t)val_ptr[k] << 8) | val_ptr[k + 1];
+                if (u16 == 0x0020 && k >= fixed_width - 4) continue;
+                out_buf[pos++] = (u16 >= 32 && u16 < 127) ? (char)u16 : '?';
+            }
+            out_buf[pos] = '\0';
+            rtrim(out_buf);
+            break;
+        }
+        case 0x0201: { /* VARGRAPHIC (UTF-16BE) */
+            uint16_t var_off = *(const uint16_t *)(val_ptr + 0);
+            uint16_t var_len = *(const uint16_t *)(val_ptr + 2);
+            if (8 + var_off + var_len <= rec_len) {
+                const uint8_t *s = fixed_base + var_off;
+                size_t pos = 0;
+                for (uint16_t k = 0; k + 1 < var_len && pos + 1 < out_sz; k += 2) {
+                    uint16_t u16 = ((uint16_t)s[k] << 8) | s[k + 1];
+                    out_buf[pos++] = (u16 >= 32 && u16 < 127) ? (char)u16 : '?';
+                }
+                out_buf[pos] = '\0';
+                rtrim(out_buf);
+            } else {
+                snprintf(out_buf, out_sz, "<vargraphic>");
+            }
             break;
         }
         default: {

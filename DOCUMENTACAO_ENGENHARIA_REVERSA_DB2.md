@@ -1201,5 +1201,87 @@ O leitor e roteador físico [`db2_partition_seek.c`](file:///desenv/db2/db2_part
 
 E todos os 4 trimestres foram testados com pruning perfeito de 75% de redução de I/O em cada consulta.
 
+---
+
+## 19. Codificação Físico-Binária Completa de Tipos de Dados Complexos
+
+### 19.1 Tabela Geral de Tipos Físicos no Motor Db2 (`col_type`)
+A estrutura interna do `Table Description Record` (Slot 3 da Página 0) identifica a tipagem física através do campo `col_type`:
+
+| Código Físico (`col_type`) | Tipo SQL Db2 | Largura Fixa (`fixed_width`) | Formato de Codificação em Disco |
+|:---:|:---|:---:|:---|
+| **`0x0000`** | `SMALLINT` | 2 bytes | Inteiro com sinal de 16 bits little-endian (Int16). |
+| **`0x0001`** | `INTEGER` | 4 bytes | Inteiro com sinal de 32 bits little-endian (Int32). |
+| **`0x0002`** | `DECIMAL(p, s)` | $\lfloor p/2 \rfloor + 1$ bytes | Packed Decimal BCD. `col_len` armazena `(escala << 8) | precisao`. Nibble de sinal no final: `0x0C`/`0x0A`/`0x0F` (positivo) e `0x0D`/`0x0B` (negativo). |
+| **`0x0003`** | `REAL / FLOAT4` | 4 bytes | Ponto flutuante IEEE 754 de precisão simples (Float32). |
+| **`0x0004`** | `DOUBLE / FLOAT8` | 8 bytes | Ponto flutuante IEEE 754 de precisão dupla (Float64). |
+| **`0x0005`** | `BIGINT` | 8 bytes | Inteiro com sinal de 64 bits little-endian (Int64). |
+| **`0x0006`** | `DECFLOAT(16)` | 8 bytes | Ponto flutuante decimal de 16 dígitos (IEEE 754-2008 / DPD). |
+| **`0x0007`** | `DECFLOAT(34)` | 16 bytes | Ponto flutuante decimal de 34 dígitos (IEEE 754-2008 / DPD). |
+| **`0x0100`** | `CHAR(N)` | $N$ bytes | String textual ASCII/EBCDIC de tamanho fixo preenchida com espaços à direita. |
+| **`0x0101`** | `VARCHAR(N)` | 4 bytes | Apontador no registro fixo: `uint16_t offset` + `uint16_t length` na área variável. |
+| **`0x0105`** | `DATE` | 4 bytes | Packed BCD no formato `YYYYMMDD` (ex: `20240115` = `20 24 01 15`). |
+| **`0x0106`** | `TIME` | 3 bytes | Packed BCD no formato `HHMMSS` (ex: `143045` = `14 30 45`). |
+| **`0x0107`** | `TIMESTAMP(p)` | $7 + \lfloor (p+1)/2 \rfloor$ bytes | Packed BCD com precisão configurável de $0$ a $12$ dígitos de sub-segundos. |
+| **`0x0108`** | `BLOB(N)` | 4 bytes | Descritor de LOB inline (Tag `0x69`) ou out-of-line (Tag `0x49`). |
+| **`0x0109`** | `CLOB(N)` | 4 bytes | Descritor de LOB textual inline ou out-of-line. |
+| **`0x010F`** | `BOOLEAN` | 1 byte | Byte booleano: `0x01` = `TRUE`, `0x00` = `FALSE`, byte nulo para `UNKNOWN`. |
+| **`0x0110`** | `BINARY(N)` | $N$ bytes | Byte array binário bruto de tamanho fixo. |
+| **`0x0111`** | `VARBINARY(N)` | 4 bytes | Byte array de tamanho variável (offset + len na área variável). |
+| **`0x0112`** | `XML` | 80 bytes | pureXML DocID ancorando o documento na área XDA (`obj_type = 0x06`). |
+| **`0x0200`** | `GRAPHIC(N)` | $2N$ bytes | String double-byte de tamanho fixo em **UTF-16 Big-Endian (UCS-2BE)**. |
+| **`0x0201`** | `VARGRAPHIC(N)` | 4 bytes | String double-byte de tamanho variável (UTF-16BE na área variável). |
+
+---
+
+### 19.2 Regras de Decodificação dos Tipos Especiais
+
+#### 1. DECIMAL / NUMERIC (Packed Decimal com Sinal em Nibble)
+* O tamanho físico em bytes é dado por $\lfloor \mathtt{precisao}/2 \rfloor + 1$.
+* Cada byte armazena dois dígitos BCD de 4 bits, com exceção do último byte:
+  * O nibble superior do último byte armazena o último dígito.
+  * O nibble inferior armazena o **código de sinal**:
+    * `0x0C`, `0x0A`, `0x0F`, `0x0E`: **Positivo (`+`)**
+    * `0x0D`, `0x0B`: **Negativo (`-`)**
+* O ponto decimal é posicionado inserindo o caractere `.` exatamente a $\mathtt{escala}$ posições antes do final.
+
+#### 2. TIMESTAMP com Precisão Variável (`0` a `12` Casas Decimais)
+O Db2 armazena a parte data/hora em 7 bytes BCD (`YYYYMMDDHHMMSS`), anexando nibbles BCD para as frações de segundo conforme a precisão $p$:
+* **`TIMESTAMP(0)` (7 bytes):** `20 26 10 21 18 25 30` $\to$ `2026-10-21 18:25:30`.
+* **`TIMESTAMP(6)` (10 bytes):** `20 26 10 21 18 25 30 12 34 56` $\to$ `2026-10-21 18:25:30.123456`.
+* **`TIMESTAMP(12)` (13 bytes):** `20 26 10 21 18 25 30 12 34 56 78 90 12` $\to$ `2026-10-21 18:25:30.123456789012`.
+
+#### 3. GRAPHIC e VARGRAPHIC (Unicode UTF-16 Big-Endian)
+Ao contrário das colunas de texto normais (codepage da base, ex: 1208/819), as colunas `GRAPHIC` são armazenadas em **UTF-16BE**:
+* A string `'UNICODE_10'` é codificada como:
+  `00 55 00 4E 00 49 00 43 00 4F 00 44 00 45 00 5F 00 31 00 30`
+* O decodificador lê palavras de 16 bits `(b0 << 8) | b1` e converte para caracteres UTF-8.
+
+---
+
+### 19.3 Validação Integrada no `db2_select`
+
+A rotina `format_column_value` do utilitário autônomo [`db2_select.c`](file:///desenv/db2/db2_select.c) foi estendida e validada diretamente sobre a tabela `ERP.LAB_TIPOS_COMPLEXOS` (15 colunas):
+
+```
+====================================================================================================
+ CONSULTA FÍSICA DIRETA EM DISCO — ERP.LAB_TIPOS_COMPLEXOS (Banco: ERP)
+====================================================================================================
+  Diretório Controle : /db2data_erp/db/erp/NODE0000/SQL00001
+  Tablespace         : ERPTBS01 (ID = 4 | PageSize = 4096 B | ExtentSize = 32 | 1 Container(s))
+  Container [0]       : /db2data_erp/data/erp/NODE0000/ERP/T0000004/C0000000.LRG
+  Object ID (FID)    : 14 (Data EMP = Pool Page 2976 | 1 página(s) de dados de 4 KB)
+  Colunas / Linhas   : 15 colunas | Cardinalidade Catálogo = 2
+
+  +----+-------------+----------------+----------------+----------------+----------------+----------+---------------------+----------------------------+----------------------------+----------+------------+---------------+-------------+----------------+
+  | ID | COL_DEC5_2  | COL_DEC15_4    | COL_DEC31_6    | COL_DECFLOAT16 | COL_DECFLOAT34 | COL_TIME | COL_TS0             | COL_TS6                    | COL_TS12                   | COL_BOOL | COL_BINARY | COL_VARBINARY | COL_GRAPHIC | COL_VARGRAPHIC |
+  +----+-------------+----------------+----------------+----------------+----------------+----------+---------------------+----------------------------+----------------------------+----------+------------+---------------+-------------+----------------+
+  |  1 |      123.45 | -987654321.123 | 12345678901234 | DF(0x262534...) | DF(0x6E18F7...) | 14:30:45 | 2026-10-21 18:25:30 | 2026-10-21 18:25:30.123456 | 2026-10-21 18:25:30.123456 | TRUE     | BX'0102... | BX'AABBCC...  | UNICODE_10  | TESTE_VARGRAPH |
+  |  2 |       -0.05 |         0.0000 |      -1.000000 | DF(0xA1FC00...) | DF(0xA5F353...) | 00:00:00 | 2000-01-01 00:00:00 | 2000-01-01 00:00:00.000001 | 2000-01-01 00:00:00.000000 | FALSE    | BX'FFFF... | BX'001122'    | ZERO_PAD    | SEGUNDA LINHA  |
+  +----+-------------+----------------+----------------+----------------+----------------+----------+---------------------+----------------------------+----------------------------+----------+------------+---------------+-------------+----------------+
+  >> Total de 2 registro(s) lido(s) diretamente do(s) container(s).
+```
+
+
 
 
