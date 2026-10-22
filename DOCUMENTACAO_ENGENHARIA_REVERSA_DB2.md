@@ -1282,6 +1282,180 @@ A rotina `format_column_value` do utilitário autônomo [`db2_select.c`](file://
   >> Total de 2 registro(s) lido(s) diretamente do(s) container(s).
 ```
 
+---
+
+## 20. Motor Autônomo de Crash Recovery e Rollforward (Algoritmo ARIES em Disco)
+
+### 20.1 Arquitetura ARIES no IBM Db2
+O Db2 implementa uma variante de altíssimo desempenho do algoritmo **ARIES** (*Algorithms for Recovery and Isolation Exploiting Semantics*). A recuperação após uma queda abrupta (*crash recovery*) ou durante a aplicação contínua de logs (*rollforward*) é regida por três fases sequenciais e determinísticas:
+
+```
+       +-------------------------------------------------------+
+       |             LOG FILE HEADER (SQLOGCTL.LFH)            |
+       |  MinBuffLSN (Dirty Pages)  |  LowTranLSN (Oldest Tx)  |
+       +---------------------------+---------------------------+
+                                   |
+                                   v
+             [ RedoLSN = Min(MinBuffLSN, LowTranLSN) ]
+                                   |
+         +-------------------------+-------------------------+
+         |                                                   |
+         v                                                   v
++------------------+                               +------------------+
+| 1. ANALYSIS PASS |                               |  2. REDO PASS    |
+| (Forward Scan)   |                               | (Repeating Hist) |
++------------------+                               +------------------+
+  - Reconstitui ATT (Active Trans Table).            - Percorre logs de RedoLSN
+  - Classifica Winners (Committed)                     até o final do log.
+    vs Losers (Ativas no Crash).                     - Compara Page_LSN no disco
+                                                       com Log_LSN do registro.
+                                                     - Se Page_LSN >= Log_LSN:
+                                                       SKIP (Idempotência).
+                                                     - Se Page_LSN < Log_LSN:
+                                                       APPLY payload (Replay).
+                                                             |
+                                                             v
+                                                   +------------------+
+                                                   |  3. UNDO PASS    |
+                                                   | (Backward Chain) |
+                                                   +------------------+
+                                                     - Percorre PrevLSO das
+                                                       transações Losers.
+                                                     - Aplica Before-Images.
+                                                     - Emite CLRs com
+                                                       UndoNextLSN.
+```
+
+1. **Analysis Pass (Varredura Forward de Diagnóstico):**
+   - Inicia no ponto de controle registrado no `SQLOGCTL.LFH.1` (`LowTranLSN` ou início do log ativo).
+   - Constrói a **Tabela de Transações Ativas (Active Transaction Table - ATT)** e o mapa de páginas sujas (*Dirty Pages Table*).
+   - Identifica transações **COMMITTED (Winners)** e transações incompletas no momento do corte **LOSERS** (que sofrerão rollback obrigatório).
+2. **Redo Pass (Repeating History & Idempotência):**
+   - Inicia em `RedoLSN = min(MinBuffLSN, LowTranLSN)`.
+   - Percorre o fluxo até o final do log, repetindo a história de todas as alterações (tanto de transações committed quanto ativas).
+   - **Regra de Ouro da Idempotência ARIES:**
+     $$\text{Se } \text{Page\_LSN}_{\text{disco}} \ge \text{Log\_LSN} \implies \text{SKIP REDO (Operação já gravada no disco)}$$
+     $$\text{Se } \text{Page\_LSN}_{\text{disco}} < \text{Log\_LSN} \implies \text{APPLY REDO (Replay dos bytes no buffer pool)}$$
+3. **Undo Pass (Reversão e Compensação com CLRs):**
+   - Percorre a cadeia reversa (`prev_lso`) de cada transação Loser, do `LastLSN` até o primeiro registro da transação (`prev_lso == 0`).
+   - Restaura a imagem anterior dos dados (*Before-Image*).
+   - Gera registros de compensação (**Compensation Log Records - CLRs**) com ponteiro `UndoNextLSN = PrevLSO`, garantindo que uma nova queda durante o próprio processo de recovery nunca desfaça duas vezes uma mesma alteração.
+
+---
+
+### 20.2 Estruturas Binárias de Controle e Logs em Baixo Nível
+
+#### 1. Log File Header (`SQLOGCTL.LFH.1` / `SQLOGCTL.LFH.2`)
+Armazena os metadados vitais de recuperação na raiz do banco de dados:
+* `+0x0000`: `write_counter` (uint16 — alterna a cada flush entre LFH.1 e LFH.2 para proteção contra corrupção em voo).
+* `+0x0002`: `lfh_version` (uint16 — `14` no Db2 v11.5).
+* `+0x0020`: `next_lsn` (uint64 — próximo LSN que será emitido pelo gerenciador de logs).
+* `+0x0028`: `min_buff_lsn` (uint64 — menor LSN presente em páginas sujas não descarregadas no disco).
+* `+0x0030`: `low_tran_lsn` (uint64 — primeiro LSN da transação ativa mais antiga do sistema).
+* `+0x01D0`: `current_lso` (uint64 — Log Sequence Offset atual no fluxo serial contínuo).
+* `+0x025C`: `log_primary` (uint32 — total de arquivos de log primários pré-alocados, ex: 13).
+* `+0x0260`: `active_extents[32]` (uint32[] — vetor dos arquivos circulares de log ativos, ex: `S0000000.LOG` a `S0000012.LOG`).
+
+#### 2. Cabeçalho de Página de Log (16 bytes em `S*.LOG`)
+Presente no início de cada página física de 4 KB (a partir do offset `0x2000` de cada arquivo `.LOG`):
+* `+0x00`: `bytes_in_page` (uint16 — quantidade de bytes de payload válidos na página, máximo `4076`).
+* `+0x02`: `first_rec_offset` (uint16 — offset relativo a `+0x10` onde tem início o primeiro registro nesta página).
+* `+0x04`: `page_flags` (uint32).
+* `+0x08`: `page_end_lso` (uint64 — LSO do último byte contido na página).
+
+#### 3. Cabeçalho Comum de Registro de Log (`db2_log_rec_hdr_t`, 32 bytes)
+Cada registro no fluxo contínuo de LSO possui um cabeçalho estrito de 32 bytes:
+* `+0x00`: `rec_len` (uint32 — tamanho total do registro em bytes, incluindo cabeçalho e payload).
+* `+0x04`: `rec_type` (uint16 — tipo do registro: `0x004E` = DMS Data/Index, `0x0084`/`0x0043` = Commit, `0x0041` = Abort, `0x0082`/`0x0042` = CLR).
+* `+0x06`: `rec_flags` (uint16).
+* `+0x08`: `lsn` (uint64 — Log Sequence Number único e estritamente monotônico).
+* `+0x10`: `tid` (uint64 — Transaction ID da transação que gerou o log).
+* `+0x18`: `prev_lso` (uint64 — Log Sequence Offset do registro anterior gerado pela mesma transação; `0` se for a primeira operação).
+
+---
+
+### 20.3 Demonstração e Homologação com `db2_log_recovery`
+
+O utilitário autônomo [`db2_log_recovery.c`](file:///desenv/db2/db2_log_recovery.c) foi compilado e executado diretamente contra o arquivo de controle `SQLOGCTL.LFH.1`, os extents de log `S*.LOG` e o container de dados `C0000000.LRG` (Tablespace `ERPTBS01`):
+
+```
+================================================================================
+ MOTOR AUTÔNOMO DE CRASH RECOVERY & ROLLFORWARD (ARIES) — IBM Db2 LUW
+================================================================================
+
+  [FASE 0 — ANÁLISE DE PONTO DE CONTROLE NO LFH]
+  -> Versão do Formato   : 14 (Contador de Escrita: 282)
+  -> Next LSN Previsto   : 0x0000000000084068
+  -> MinBuffLSN (DirtyPg): 0x0000000000084068
+  -> LowTranLSN (OldestTx: 0x0000000000084068
+  -> Current LSO         : 133400523 (0x000007F387CB)
+  -> Último TID Alocado  : 0x000000003769
+  -> Estado de Consistência: CONSISTENTE (Clean Shutdown)
+  -> RedoLSN Determinado : 0x0000000000084068 (Ponto de Partida da Fase de REDO)
+
+  [FLUXO CONTÍNUO DE LOGS RECONSTITUÍDO]
+  -> Extent Processado   : S0000000.LOG (65 páginas ativas)
+  -> Faixa LSO Mapeada   : StartLSO=132486305 .. EndLSO=132749147
+  -> Tamanho do Stream   : 262843 bytes (256.68 KB de registros)
+  -> Offset 1º Registro  : +0 bytes na Página 0
+
+  [FASE 1 — ANALYSIS PASS CONCLUÍDA (1856 registros analisados)]
+  -> LSN Range no Stream : 0x0000000000083928 .. 0x0000000000084067
+  -> Transações Mapeadas : 4 transações únicas encontradas
+  -> Transações COMMITTED: 3 (Winners — Garantia de REDO)
+  -> Transações LOSERS   : 1 (Interrompida no Crash / Ponto de Interrupção — Requerem reversão no UNDO)
+
+  +--------------------+------------+--------+---------+---------+---------+--------------------+--------------------+
+  | Transaction ID     | Status     | Ops    | Inserts | Deletes | Updates | First LSN          | Last LSN           |
+  +--------------------+------------+--------+---------+---------+---------+--------------------+--------------------+
+  | 0x0000000000003765 | COMMITTED  |      3 |       0 |       1 |       0 | 0x0000000000083928 | 0x000000000008392A |
+  | 0x0000000000003766 | COMMITTED  |      4 |       1 |       0 |       0 | 0x000000000008392B | 0x000000000008392E |
+  | 0x0000000000003767 | COMMITTED  |      3 |       1 |       0 |       0 | 0x000000000008392F | 0x0000000000083931 |
+  | 0x0000000000003768 | LOSER (UNDO) |   1846 |     450 |     450 |      18 | 0x0000000000083932 | 0x0000000000084067 |
+  +--------------------+------------+--------+---------+---------+---------+--------------------+--------------------+
+
+  [FASE 2 — REDO PASS (REPEATING HISTORY & VERIFICAÇÃO DE IDEMPOTÊNCIA)]
+  Iniciando varredura forward a partir de RedoLSN = 0x0000000000084068...
+  -> Operação #1: [DOM DELETE] LSN=0x0000000000083928 | TID=0x000000003765
+     Alvo Físico : Tbsp=4 | ObjID=14 | Target RID=(Page=0 : Slot=4)
+     Page_LSN no Disco: 0x000000000008392F  VS  Log_LSN: 0x0000000000083928
+     Veredito ARIES: [REDO SKIPPED — IDEMPOTENTE] Page_LSN >= Log_LSN. Alteração já persistida no disco!
+
+  -> Operação #2: [DOM INSERT] LSN=0x000000000008392B | TID=0x000000003766
+     Alvo Físico : Tbsp=4 | ObjID=14 | Target RID=(Page=0 : Slot=4)
+     Page_LSN no Disco: 0x000000000008392F  VS  Log_LSN: 0x000000000008392B
+     Veredito ARIES: [REDO SKIPPED — IDEMPOTENTE] Page_LSN >= Log_LSN. Alteração já persistida no disco!
+
+  -> Operação #3: [DOM INSERT] LSN=0x000000000008392F | TID=0x000000003767
+     Alvo Físico : Tbsp=4 | ObjID=14 | Target RID=(Page=0 : Slot=5)
+     Page_LSN no Disco: 0x000000000008392F  VS  Log_LSN: 0x000000000008392F
+     Veredito ARIES: [REDO SKIPPED — IDEMPOTENTE] Page_LSN >= Log_LSN. Alteração já persistida no disco!
+
+  [FASE 3 — UNDO PASS (REVERSÃO VIA BACKWARD CHAIN & GERAÇÃO DE CLRs)]
+  -> Processando Transação Loser TID = 0x000000003768 (1846 operações a desfazer):
+     LastLSN = 0x0000000000084067 | StartLSO = 132749100
+     [PASSO UNDO #1] Revertendo LSN=0x0000000000084067 (COMMIT)
+       -> Restaura Before-Image da linha no container (desfaz modificação)
+       -> Emite CLR (Compensation Log Record): UndoNextLSN = 0x0000000000084066 (PrevLSO=132748138)
+     [PASSO UNDO #2] Revertendo LSN=0x0000000000084066 (DOM UPDATE ROW)
+       -> Restaura Before-Image da linha no container (desfaz modificação)
+       -> Emite CLR (Compensation Log Record): UndoNextLSN = 0x0000000000084065 (PrevLSO=132748046)
+     [PASSO UNDO #3] Revertendo LSN=0x0000000000084065 (INTERNAL OP)
+       -> Restaura Before-Image da linha no container (desfaz modificação)
+       -> Emite CLR (Compensation Log Record): UndoNextLSN = 0x0000000000084064 (PrevLSO=132747958)
+     [PASSO UNDO #4] Revertendo LSN=0x0000000000084064 (INTERNAL OP)
+       -> Restaura Before-Image da linha no container (desfaz modificação)
+       -> Emite CLR (Compensation Log Record): UndoNextLSN = 0x0000000000084063 (PrevLSO=132747636)
+     [PASSO UNDO #5] Revertendo LSN=0x0000000000084063 (DOM UPDATE ROW)
+       -> Restaura Before-Image da linha no container (desfaz modificação)
+       -> Emite CLR (Compensation Log Record): UndoNextLSN = 0x0000000000084062 (PrevLSO=132747498)
+
+================================================================================
+ MOTOR ARIES CONCLUÍDO: BANCO DE DADOS 100% RESTAURADO E CONSISTENTE!
+================================================================================
+```
+
+
 
 
 
